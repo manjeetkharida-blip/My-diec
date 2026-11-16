@@ -1,4 +1,4 @@
-# nftbot_all.py — single-process Flask app for Railway (SQLite, api-keys, panel)
+# nftbot_all.py — single-process Flask app for Railway
 import os, json, sys, re, time, sqlite3, threading, urllib.parse, secrets, hashlib, logging
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -20,7 +20,6 @@ PANEL_PASS  = os.environ.get("PANEL_PASS", "")
 PANEL_SECRET = os.environ.get("PANEL_SECRET") or secrets.token_hex(32)
 MAX_FAILS   = 5
 
-# make sure /data exists if the volume is mounted there
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 # ---------------- netflix api ----------------
@@ -210,13 +209,82 @@ def extract_cookie_dict(text):
     if m: out["profileId"] = m.group(1)
     return out
 
+def deep_search(data, keys):
+    if isinstance(data, dict):
+        for k, v in data.items():
+            if k in keys and v:
+                return v
+            res = deep_search(v, keys)
+            if res: return res
+    elif isinstance(data, list):
+        for item in data:
+            res = deep_search(item, keys)
+            if res: return res
+    return None
+
+def check_premium_status(cookies_dict):
+    """Returns (plan, status, reason). If not premium/active, reason explains why."""
+    session = requests.Session()
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    }
+    session.headers.update(headers)
+    session.cookies.update(cookies_dict)
+    
+    try:
+        resp = session.get("https://www.netflix.com/browse", timeout=15, allow_redirects=True)
+        if resp.status_code != 200 or "login" in resp.url.lower():
+            return None, None, "dead"
+    except:
+        return None, None, "dead"
+        
+    plan = "Unknown"
+    status = "Active"
+    auth_url = None
+    
+    try:
+        resp = session.get("https://www.netflix.com/account", timeout=15, allow_redirects=True)
+        if resp.status_code == 200 and "login" not in resp.url.lower():
+            html_text = resp.text
+            auth_match = re.search(r'"authURL"\s*:\s*"([^"]+)"', html_text)
+            if auth_match:
+                auth_url = auth_match.group(1).replace('\\u002F', '/')
+    except:
+        pass
+        
+    if auth_url:
+        gql_headers = {
+            'User-Agent': headers['User-Agent'],
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+            'Origin': 'https://www.netflix.com',
+            'Referer': 'https://www.netflix.com/account'
+        }
+        payload = {
+            "operationName": "AccountQuery",
+            "variables": {},
+            "query": "query AccountQuery { account { emailAddress { value } countryOfSignup membershipStatus currentPlan { planName } } }"
+        }
+        try:
+            gql_resp = session.post(auth_url, headers=gql_headers, json=payload, timeout=15)
+            if gql_resp.status_code == 200:
+                gql_data = gql_resp.json()
+                plan_val = deep_search(gql_data, ["planName"])
+                if plan_val: plan = plan_val
+                status_val = deep_search(gql_data, ["membershipStatus", "status", "holdStatus"])
+                if status_val: status = status_val
+        except:
+            pass
+            
+    return plan, status, None
+
 def fetch_token(netflix_id):
     h = dict(BASE_HEADERS); h["Cookie"] = f"NetflixId={netflix_id}"
     r = requests.get(API_URL, params=QUERY_PARAMS, headers=h, timeout=25, verify=False)
     r.raise_for_status()
     td = (((r.json().get("value") or {}).get("account") or {}).get("token") or {}).get("default") or {}
     token = td.get("token"); expires = td.get("expires")
-    if not token: raise ValueError("no token in response (cookie expired/invalid)")
+    if not token: raise ValueError("no token in response")
     if isinstance(expires, int) and len(str(expires)) == 13: expires //= 1000
     return token, expires
 
@@ -294,11 +362,41 @@ def generate_link(api_key_id=None, max_attempts=20):
                 raise RuntimeError(f"pool exhausted after {attempts} attempts: {last_err}")
             continue
         tried.add(cid); attempts += 1
+        
         try:
+            # 1. Parse cookie dict from raw
+            ck = extract_cookie_dict(row["netflix_id"]) # Actually need the raw text here
+            with db() as c:
+                raw_cookie = c.execute("SELECT raw FROM cookies WHERE id=?", (cid,)).fetchone()["raw"]
+            cookie_dict = extract_cookie_dict(raw_cookie)
+            
+            # 2. Check Server Plan + Status
+            plan, status, reason = check_premium_status(cookie_dict)
+            
+            if reason == "dead":
+                last_err = "dead (checked via web)"
+                with _lock, db() as c:
+                    c.execute("UPDATE cookies SET deleted=1,last_error=? WHERE id=?", (last_err, cid))
+                continue # Skip to next cookie
+                
+            if (plan or "").lower() != "premium":
+                last_err = f"not premium: {plan}"
+                with _lock, db() as c:
+                    c.execute("UPDATE cookies SET deleted=1,last_error=? WHERE id=?", (last_err, cid))
+                continue # Skip to next cookie
+                
+            if status and status.upper() in ("ON_HOLD", "PAST_DUE", "SUSPENDED"):
+                last_err = f"on hold: {status}"
+                with _lock, db() as c:
+                    c.execute("UPDATE cookies SET deleted=1,last_error=? WHERE id=?", (last_err, cid))
+                continue # Skip to next cookie
+
+            # 3. If it passes all checks, get the nftoken
             token, expires = fetch_token(row["netflix_id"])
             url = f"https://www.netflix.com/login?nftoken={token}"
             if row["profile_id"]: url += f"&profileIds={row['profile_id']}"
             meta = json.loads(row["meta_json"]) if row["meta_json"] else {}
+            
             with _lock, db() as c:
                 c.execute("UPDATE cookies SET ok_count=ok_count+1,fail_count=0,last_used=? WHERE id=?",
                           (time.time(), cid))
@@ -306,12 +404,14 @@ def generate_link(api_key_id=None, max_attempts=20):
                                 "VALUES(?,?,?,?,?,?)", (cid, api_key_id, token, url, expires, time.time()))
                 return {"url": url, "expires": expires, "cookie_id": cid,
                         "attempts": attempts, "token_id": cur.lastrowid, "meta": meta}
+                        
         except Exception as e:
             last_err = str(e)
             with _lock, db() as c:
                 c.execute("UPDATE cookies SET fail_count=fail_count+1,last_error=?,last_used=? WHERE id=?",
                           (last_err[:500], time.time(), cid))
                 c.execute("UPDATE cookies SET deleted=1 WHERE id=? AND fail_count>=?", (cid, MAX_FAILS))
+                
     raise RuntimeError(f"gave up after {attempts} attempts: {last_err}")
 
 def list_cookies(offset=0, limit=200, include_dead=False):
