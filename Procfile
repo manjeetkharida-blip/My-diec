@@ -1,1 +1,1 @@
-web: python nftbot_all.py
+web: python Mf.py
