@@ -1,4 +1,4 @@
-# nftbot_all.py — single-process Flask app for Railway
+# nftbot_all.py — single-process Flask app for Railway (serves console + API)
 import os, json, sys, re, time, sqlite3, threading, urllib.parse, secrets, hashlib, logging
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -6,7 +6,8 @@ from functools import wraps
 import requests
 from urllib3.exceptions import InsecureRequestWarning
 from flask import (Flask, request, redirect, session, render_template_string,
-                   url_for, jsonify)
+                   url_for, jsonify, send_from_directory)
+from flask_cors import CORS
 
 requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
 
@@ -337,12 +338,24 @@ def revive_cookie(cid):
 def hard_delete(cid):
     with _lock, db() as c: c.execute("DELETE FROM cookies WHERE id=?", (cid,))
 
+def bulk_delete(ids):
+    if not ids: return
+    with _lock, db() as c:
+        placeholders = ','.join(['?'] * len(ids))
+        c.execute(f"DELETE FROM cookies WHERE id IN ({placeholders})", ids)
+
 # ---------------- app ----------------
 app = Flask(__name__)
+CORS(app, origins="*", allow_headers=["Content-Type", "X-API-Key"])
 app.secret_key = PANEL_SECRET
 app.config["MAX_CONTENT_LENGTH"] = 256 * 1024 * 1024
 
 init_db()
+
+# ---------------- console route ----------------
+@app.route("/console", methods=["GET"])
+def console():
+    return send_from_directory(".", "console.html")
 
 # ---------------- api ----------------
 @app.route("/api/generate", methods=["POST", "GET"])
@@ -356,7 +369,6 @@ def api_generate():
         log.warning("generate failed: %s", e)
         return jsonify({"ok": False, "error": str(e)}), 502
         
-    # Add credit to the response metadata
     r["meta"]["credit"] = "STFAIR dev styfair (@styfair)"
     
     return jsonify({"ok": True, "url": r["url"], "expires": r["expires"],
@@ -619,16 +631,12 @@ def bulk():
 
 @app.route("/panel/bulk_delete", methods=["POST"])
 @login_required
-def bulk_delete():
+def bulk_delete_route():
     ids = request.form.getlist("ids")
     if not ids:
         session["flash"] = "No cookies selected."; session["flash_err"] = True
         return redirect(url_for("panel"))
-    
-    with _lock, db() as c:
-        placeholders = ','.join(['?'] * len(ids))
-        c.execute(f"DELETE FROM cookies WHERE id IN ({placeholders})", ids)
-        
+    bulk_delete(ids)
     session["flash"] = f"Deleted {len(ids)} cookies."
     return redirect(url_for("panel"))
 
