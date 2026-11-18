@@ -1,5 +1,5 @@
 # nftbot_all.py — single-process Flask app for Railway
-import os, json, sys, re, time, sqlite3, threading, urllib.parse, secrets, hashlib, logging, random
+import os, json, sys, re, time, sqlite3, threading, urllib.parse, secrets, hashlib, logging
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from functools import wraps
@@ -375,11 +375,20 @@ def console():
 def health():
     return jsonify({"ok": True, "service": "nftoken-api", "db": DB_PATH})
 
+@app.route("/api/debug-env", methods=["GET"])
+def debug_env():
+    return jsonify({
+        "panel_pass_set": bool(os.environ.get("PANEL_PASS")),
+        "panel_pass_len": len(os.environ.get("PANEL_PASS", "")),
+        "panel_pass_first_char": (os.environ.get("PANEL_PASS", "")[:1] or "EMPTY"),
+        "panel_secret_set": bool(os.environ.get("PANEL_SECRET")),
+        "db_url_set": bool(os.environ.get("POOL_DB")),
+    })
+
 # ---------------- public API with security ----------------
 
 def cleanup_nonces():
     with _lock, db() as c:
-        # Delete nonces older than 60 seconds
         c.execute("DELETE FROM nonces WHERE created_at < ?", (time.time() - 60,))
 
 @app.route("/api/public-challenge", methods=["GET"])
@@ -387,10 +396,8 @@ def public_challenge():
     cleanup_nonces()
     nonce = secrets.token_urlsafe(16)
     ip = request.headers.get("X-Forwarded-For", request.remote_addr)
-    
     with _lock, db() as c:
         c.execute("INSERT INTO nonces(nonce,ip,created_at) VALUES(?,?,?)", (nonce, ip, time.time()))
-    
     return jsonify({"ok": True, "nonce": nonce})
 
 @app.route("/api/public-generate", methods=["POST"])
@@ -407,25 +414,12 @@ def public_generate():
     cleanup_nonces()
     
     with _lock, db() as c:
-        # Verify nonce exists, matches IP, and hasn't been used
         row = c.execute("SELECT nonce FROM nonces WHERE nonce=? AND ip=?", (nonce, ip)).fetchone()
         if not row:
             return jsonify({"ok": False, "error": "Invalid or expired challenge. Please refresh."}), 403
-            
-        # Burn nonce so it can't be reused
         c.execute("DELETE FROM nonces WHERE nonce=?", (nonce,))
         
-        # Rate limit check: ensure last issued token for this IP was >30 seconds ago
-        last_token = c.execute(
-            "SELECT created_at FROM issued_tokens WHERE user_agent LIKE ? ORDER BY id DESC LIMIT 1", 
-            (f"%{ip}%",)
-        ).fetchone()
-        
-        # Simplistic IP tracking via user_agent hack, or you can add an `ip` column to issued_tokens.
-        # For now, rely purely on nonce burning as the rate limit.
-        
     try:
-        # Generate link matching filters
         r = generate_link(plan=plan, country=country)
         r["meta"]["credit"] = "STYFAIR dev styfair (@styfair)"
         return jsonify({"ok": True, "url": r["url"], "expires": r["expires"],
@@ -434,17 +428,14 @@ def public_generate():
         log.warning("public generate failed: %s", e)
         return jsonify({"ok": False, "error": str(e)}), 502
 
-# ---------------- direct cookie verify ----------------
 @app.route("/api/direct-cookie", methods=["POST"])
 def api_direct_cookie():
     data = request.get_json(silent=True) or {}
     raw_cookie = data.get("cookie")
     if not raw_cookie: return jsonify({"ok": False, "error": "No cookie provided."}), 400
-    
     ck = extract_cookie_dict(raw_cookie)
     nid = ck.get("NetflixId")
     if not nid: return jsonify({"ok": False, "error": "No NetflixId found in cookie."}), 400
-    
     try:
         token, expires = fetch_token(nid)
         meta = parse_metadata(raw_cookie)
@@ -476,14 +467,17 @@ def api_status():
 def verify_admin_pass():
     return request.headers.get("X-Admin-Pass") == PANEL_PASS
 
+@app.route("/api/admin/verify", methods=["GET"])
+def admin_verify():
+    if not verify_admin_pass():
+        return jsonify({"ok": False, "error": "invalid password"}), 401
+    return jsonify({"ok": True})
+
 @app.route("/api/admin/keys", methods=["GET", "POST"])
 def admin_keys():
     if not verify_admin_pass(): return jsonify({"ok": False, "error": "Unauthorized"}), 401
-    
     if request.method == "GET":
         return jsonify(list_api_keys())
-    
-    # POST: Mint new key
     data = request.get_json(silent=True) or {}
     label = data.get("label", "new-key")
     raw, meta = create_api_key(label=label)
