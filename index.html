@@ -1,658 +1,437 @@
 <!DOCTYPE html>
 <html lang="en" class="dark">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>CUDDLEFLIX — Premium Generator</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap" rel="stylesheet">
-  <style>
-    :root {
-      --bg-root: #060608;
-      --bg-card: #0c0c0f;
-      --bg-card-top: #121216;
-      --bg-elevated: #16161b;
-      --bg-terminal: #08080a;
-      --border-subtle: rgba(255, 255, 255, 0.08);
-      --border-rim: rgba(255, 255, 255, 0.15);
-      --border-hover: rgba(255, 255, 255, 0.24);
-      --text-primary: #f7f7f9;
-      --text-secondary: #8e8e9a;
-      --text-muted: #555560;
-      --accent-red: #E50914;
-      --accent-green: #22c55e;
-      --font-display: 'Plus Jakarta Sans', -apple-system, sans-serif;
-      --font-sans: 'Inter', -apple-system, sans-serif;
-      --font-mono: 'JetBrains Mono', monospace;
-      --radius-xl: 22px;
-      --radius-lg: 16px;
-      --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
-      --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
-    }
-
-    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
-    html { scroll-behavior: smooth; background-color: var(--bg-root); color: var(--text-primary); font-family: var(--font-sans); -webkit-font-smoothing: antialiased; }
-    body { min-height: 100vh; background-color: var(--bg-root); overflow-x: hidden; line-height: 1.5; position: relative; }
-
-    .ambient-bg {
-      position: fixed; inset: 0; pointer-events: none; z-index: 0;
-      background-image:
-        radial-gradient(ellipse 85% 45% at 50% -5%, rgba(229, 9, 20, 0.12) 0%, transparent 65%),
-        radial-gradient(rgba(255, 255, 255, 0.05) 1px, transparent 1px);
-      background-size: 100% 100%, 24px 24px;
-      mask-image: linear-gradient(to bottom, rgba(0,0,0,1) 0%, rgba(0,0,0,0.35) 55%, rgba(0,0,0,0.08) 100%);
-      -webkit-mask-image: linear-gradient(to bottom, rgba(0,0,0,1) 0%, rgba(0,0,0,0.35) 55%, rgba(0,0,0,0.08) 100%);
-    }
-
-    .container { position: relative; z-index: 1; width: 100%; max-width: 540px; margin: 0 auto; padding: 14px 16px 56px; }
-    @media (min-width: 768px) { .container { max-width: 760px; padding: 20px 24px 72px; } }
-
-    .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; color: var(--text-primary); cursor: pointer; }
-    .brand-logo { width: 46px; height: 34px; border-radius: 10px; overflow: hidden; background: #141418; border: 1px solid var(--border-rim); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 4px 12px rgba(0, 0, 0, 0.5); display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: transform 0.35s var(--ease-spring); padding: 4px; }
-    .brand:hover .brand-logo { transform: scale(1.07); }
-    .brand-logo img { width: 100%; height: 100%; object-fit: contain; display: block; }
-    .brand-name { font-family: var(--font-display); font-weight: 800; font-size: 20px; letter-spacing: -0.04em; }
-    .badge-beta { font-family: var(--font-mono); font-size: 10px; font-weight: 600; letter-spacing: 0.06em; color: var(--text-secondary); background: rgba(255, 255, 255, 0.05); border: 1px solid var(--border-subtle); padding: 2px 7px; border-radius: 999px; }
-
-    .navbar { position: sticky; top: 12px; z-index: 50; background: rgba(12, 12, 15, 0.94); border: 1px solid var(--border-subtle); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 14px 36px rgba(0, 0, 0, 0.78); border-radius: 20px; padding: 10px 14px; display: flex; align-items: center; justify-content: space-between; }
-    .icon-btn { width: 38px; height: 38px; border-radius: 12px; border: 1px solid transparent; background: transparent; color: var(--text-primary); display: inline-flex; align-items: center; justify-content: center; cursor: pointer; transition: background 0.2s ease, transform 0.15s var(--ease-spring); }
-    .icon-btn:hover { background: rgba(255, 255, 255, 0.06); }
-    .icon-btn:active { transform: scale(0.92); }
-
-    .drawer-backdrop { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.76); z-index: 60; opacity: 0; pointer-events: none; transition: opacity 0.25s var(--ease-out); }
-    .drawer-backdrop.open { opacity: 1; pointer-events: auto; }
-    .drawer-panel { position: fixed; top: 12px; left: 16px; right: 16px; max-width: 508px; margin: 0 auto; background: #101014; border: 1px solid var(--border-rim); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 28px 70px rgba(0, 0, 0, 0.9); border-radius: 22px; padding: 14px 16px 18px; z-index: 70; transform: translate3d(0, -16px, 0) scale(0.97); opacity: 0; pointer-events: none; transition: transform 0.32s var(--ease-spring), opacity 0.22s ease; }
-    .drawer-panel.open { transform: translate3d(0, 0, 0) scale(1); opacity: 1; pointer-events: auto; }
-    .drawer-links { display: flex; flex-direction: column; padding: 8px 0 14px; }
-    .drawer-link { display: flex; align-items: center; justify-content: space-between; padding: 13px 10px; color: var(--text-primary); text-decoration: none; font-size: 15px; font-weight: 500; border-radius: 10px; transition: background 0.15s ease; cursor: pointer; }
-    .drawer-link:hover { background: rgba(255, 255, 255, 0.05); }
-    .drawer-link span:last-child { color: var(--text-secondary); font-size: 14px; }
-
-    .view-section { display: none; animation: viewFadeIn 0.36s var(--ease-spring) forwards; }
-    .view-section.active { display: block; }
-    @keyframes viewFadeIn { from { opacity: 0; transform: translate3d(0, 10px, 0); } to { opacity: 1; transform: translate3d(0, 0, 0); } }
-
-    .hero { text-align: center; padding: 40px 4px 24px; }
-    .hero-title { font-family: var(--font-display); font-size: clamp(40px, 10vw, 58px); font-weight: 800; line-height: 1.04; letter-spacing: -0.04em; background: linear-gradient(180deg, #ffffff 30%, #a1a1aa 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; margin-bottom: 18px; }
-    .hero-subtitle { font-size: 15.5px; line-height: 1.6; color: var(--text-secondary); max-width: 440px; margin: 0 auto 28px; }
-
-    .btn { position: relative; overflow: hidden; display: inline-flex; align-items: center; justify-content: center; gap: 8px; width: 100%; padding: 14px 20px; border-radius: 14px; font-family: var(--font-sans); font-size: 15px; font-weight: 600; cursor: pointer; border: 1px solid transparent; transition: transform 0.2s var(--ease-spring), background-color 0.2s ease, box-shadow 0.2s ease; text-decoration: none; }
-    .btn:active { transform: scale(0.96); }
-    .btn-primary { background: linear-gradient(180deg, #ffffff 0%, #e4e4e8 100%); color: #09090b; box-shadow: inset 0 1px 0 #ffffff, 0 6px 24px rgba(255, 255, 255, 0.14); }
-    .btn-primary:hover { transform: translateY(-1px); box-shadow: inset 0 1px 0 #ffffff, 0 10px 30px rgba(255, 255, 255, 0.22); }
-    .btn-danger { background: var(--accent-red); color: #fff; box-shadow: inset 0 1px 0 rgba(255,255,255,0.2), 0 6px 24px rgba(229, 9, 20, 0.3); }
-    .btn-danger:hover { transform: translateY(-1px); box-shadow: inset 0 1px 0 rgba(255,255,255,0.3), 0 10px 30px rgba(229, 9, 20, 0.5); }
-
-    .card { position: relative; background: linear-gradient(180deg, var(--bg-card-top) 0%, var(--bg-card) 100%); border: 1px solid var(--border-subtle); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 10px 30px rgba(0, 0, 0, 0.45); border-radius: var(--radius-xl); padding: 18px; margin-bottom: 14px; transition: border-color 0.25s ease, transform 0.22s var(--ease-out); transform-style: preserve-3d; }
-    .tilt-3d { will-change: transform; transition: transform 0.18s var(--ease-out), border-color 0.25s ease; }
-    
-    .window-bar { display: flex; align-items: center; justify-content: space-between; padding-bottom: 14px; margin-bottom: 16px; border-bottom: 1px solid var(--border-subtle); }
-    .window-dots span { width: 9px; height: 9px; border-radius: 50%; background: rgba(255, 255, 255, 0.14); }
-    .window-path { font-family: var(--font-mono); font-size: 12px; color: var(--text-secondary); }
-
-    .field { margin-bottom: 18px; text-align: left; }
-    .field label { display: block; font-size: 12px; font-weight: 600; color: var(--text-secondary); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.06em; }
-    .input, .select { width: 100%; padding: 14px 16px; background: var(--bg-terminal); border: 1px solid var(--border-subtle); border-radius: 12px; color: var(--text-primary); font-size: 14px; outline: none; transition: border-color 0.2s ease, box-shadow 0.2s ease; }
-    .input:focus, .select:focus { border-color: rgba(229, 9, 20, 0.5); box-shadow: 0 0 0 3px rgba(229, 9, 20, 0.15); }
-    .select { appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%238e8e9a' stroke-width='2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 14px center; }
-
-    .segmented-control { position: relative; display: grid; grid-template-columns: 1fr 1fr; background: var(--bg-card); border: 1px solid var(--border-subtle); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04); border-radius: 16px; padding: 4px; margin-bottom: 14px; }
-    .segmented-thumb { position: absolute; top: 4px; bottom: 4px; left: 4px; width: calc(50% - 4px); background: linear-gradient(180deg, #ffffff 0%, #e4e4e8 100%); box-shadow: 0 2px 12px rgba(255, 255, 255, 0.15); border-radius: 12px; transition: transform 0.32s var(--ease-spring); z-index: 1; }
-    .segmented-control[data-active="standard"] .segmented-thumb, .segmented-control[data-active="telegram"] .segmented-thumb { transform: translate3d(100%, 0, 0); }
-    .segment-btn { position: relative; z-index: 2; background: transparent; border: none; padding: 11px 12px; font-family: var(--font-sans); font-size: 14px; font-weight: 600; color: var(--text-secondary); display: inline-flex; align-items: center; justify-content: center; gap: 8px; cursor: pointer; transition: color 0.2s ease; }
-    .segment-btn.active { color: #09090b; }
-
-    .link-result { margin-top: 20px; padding: 20px; border-radius: 12px; background: rgba(34, 197, 94, 0.08); border: 1px solid rgba(34, 197, 94, 0.3); display: none; animation: slideUp 0.4s var(--ease-spring); text-align: left; }
-    @keyframes slideUp { from { opacity: 0; transform: translateY(15px); } to { opacity: 1; transform: translateY(0); } }
-    .link-result.show { display: block; }
-    .link-result h4 { margin: 0 0 12px; font-size: 12px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; color: var(--accent-green); display: flex; align-items: center; gap: 6px;}
-    .link-result h4::before { content: '✓'; display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; background: var(--accent-green); color: #000; border-radius: 50%; font-size: 11px; }
-    .lr-link { display: flex; gap: 8px; align-items: stretch; }
-    .lr-link code { flex: 1; padding: 12px; background: #000; border: 1px solid var(--border-subtle); border-radius: 8px; font-family: var(--font-mono); font-size: 12px; color: var(--accent-green); overflow-x: auto; white-space: nowrap; word-break: break-all; display: flex; align-items: center; }
-    .link-meta { margin-top: 12px; font-size: 12.5px; color: var(--text-secondary); line-height: 1.6; }
-    .link-meta strong { color: #fff; }
-
-    /* 3D Cube styles */
-    .cube-showcase { background: radial-gradient(circle at 50% 45%, rgba(255, 255, 255, 0.055) 0%, var(--bg-card) 72%); border: 1px solid var(--border-subtle); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 16px 40px rgba(0, 0, 0, 0.55); border-radius: 24px; padding: 26px 18px 22px; text-align: center; user-select: none; }
-    .cube-stage { width: 176px; height: 176px; margin: 26px auto 30px; perspective: 900px; cursor: grab; touch-action: pan-y; }
-    .cube-3d { width: 100%; height: 100%; position: relative; transform-style: preserve-3d; will-change: transform; transform: translate3d(0, 0, 0) rotateX(-16deg) rotateY(28deg); }
-    .cube-face { position: absolute; width: 176px; height: 176px; background: linear-gradient(155deg, rgba(24, 24, 30, 0.96) 0%, rgba(10, 10, 13, 0.98) 100%); border: 1px solid rgba(255, 255, 255, 0.16); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14), inset 0 0 24px rgba(255, 255, 255, 0.03); border-radius: 22px; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 16px; backface-visibility: visible; }
-    .face-front  { transform: rotateY(0deg) translateZ(88px); }
-    .face-right  { transform: rotateY(90deg) translateZ(88px); }
-    .face-back   { transform: rotateY(180deg) translateZ(88px); }
-    .face-left   { transform: rotateY(-90deg) translateZ(88px); }
-    .face-top    { transform: rotateX(90deg) translateZ(88px); }
-    .face-bottom { transform: rotateX(-90deg) translateZ(88px); }
-    
-    .cube-face-tag { font-family: var(--font-mono); font-size: 9.5px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--text-muted); margin-bottom: 8px; }
-    .cube-face-icon { width: 36px; height: 36px; border-radius: 10px; background: rgba(255, 255, 255, 0.06); border: 1px solid rgba(255, 255, 255, 0.1); display: flex; align-items: center; justify-content: center; margin-bottom: 10px; color: #ffffff; }
-    .cube-face-title { font-family: var(--font-display); font-size: 17px; font-weight: 800; letter-spacing: -0.02em; color: #ffffff; margin-bottom: 3px; }
-    .cube-face-sub { font-family: var(--font-mono); font-size: 11px; color: var(--text-secondary); }
-    
-    .cube-pills { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; margin-top: 8px; }
-    .cube-pill-btn { background: rgba(255, 255, 255, 0.04); border: 1px solid var(--border-subtle); color: var(--text-secondary); font-family: var(--font-mono); font-size: 11px; padding: 5px 10px; border-radius: 999px; cursor: pointer; transition: all 0.2s ease; }
-    .cube-pill-btn.active, .cube-pill-btn:hover { background: #f5f5f7; color: #09090b; border-color: #f5f5f7; }
-
-    /* Admin Table */
-    .admin-table { width: 100%; border-collapse: collapse; font-size: 12px; text-align: left; }
-    .admin-table th { background: rgba(0,0,0,0.3); color: var(--text-secondary); padding: 10px 8px; border-bottom: 1px solid var(--border-subtle); text-transform: uppercase; font-size: 10px; }
-    .admin-table td { padding: 10px 8px; border-bottom: 1px solid var(--border-subtle); }
-    .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 10px; font-weight: 600; }
-    .badge.active { background: rgba(34, 197, 94, 0.15); color: var(--accent-green); }
-    .badge.revoked { background: rgba(255, 107, 107, 0.15); color: #ff6b6b; }
-    .key-reveal { background: rgba(34, 197, 94, 0.1); border: 1px solid var(--accent-green); padding: 12px; border-radius: 8px; margin-top: 12px; font-family: var(--font-mono); color: var(--accent-green); font-size: 12px; }
-    
-    .reveal { opacity: 0; transform: translate3d(0, 18px, 0); transition: opacity 0.55s var(--ease-spring), transform 0.55s var(--ease-spring); }
-    .reveal.visible { opacity: 1; transform: translate3d(0, 0, 0); }
-  </style>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>CUDDLEFLIX — Premium Generator</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap" rel="stylesheet">
+<style>
+:root{--bg-root:#060608;--bg-card:#0c0c0f;--bg-card-top:#121216;--bg-terminal:#08080a;--border-subtle:rgba(255,255,255,0.08);--border-rim:rgba(255,255,255,0.15);--text-primary:#f7f7f9;--text-secondary:#8e8e9a;--text-muted:#555560;--accent-red:#E50914;--accent-green:#22c55e;--font-display:'Plus Jakarta Sans',sans-serif;--font-sans:'Inter',sans-serif;--font-mono:'JetBrains Mono',monospace;--radius-xl:22px;--radius-lg:16px;--ease-spring:cubic-bezier(0.22,1,0.36,1);--ease-out:cubic-bezier(0.16,1,0.3,1)}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+html{scroll-behavior:smooth;background-color:var(--bg-root);color:var(--text-primary);font-family:var(--font-sans);-webkit-font-smoothing:antialiased}
+body{min-height:100vh;background-color:var(--bg-root);overflow-x:hidden;line-height:1.5;position:relative}
+.ambient-bg{position:fixed;inset:0;pointer-events:none;z-index:0;background-image:radial-gradient(ellipse 85% 45% at 50% -5%,rgba(229,9,20,0.12) 0%,transparent 65%),radial-gradient(rgba(255,255,255,0.05) 1px,transparent 1px);background-size:100% 100%,24px 24px;mask-image:linear-gradient(to bottom,#000 0%,rgba(0,0,0,0.35) 55%,rgba(0,0,0,0.08) 100%);-webkit-mask-image:linear-gradient(to bottom,#000 0%,rgba(0,0,0,0.35) 55%,rgba(0,0,0,0.08) 100%)}
+.container{position:relative;z-index:1;width:100%;max-width:540px;margin:0 auto;padding:14px 16px 56px}
+@media(min-width:768px){.container{max-width:760px;padding:20px 24px 72px}}
+.brand{display:flex;align-items:center;gap:10px;cursor:pointer}
+.brand-logo{width:46px;height:34px;border-radius:10px;overflow:hidden;background:#141418;border:1px solid var(--border-rim);box-shadow:inset 0 1px 0 rgba(255,255,255,0.12),0 4px 12px rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;padding:4px;transition:transform 0.35s var(--ease-spring)}
+.brand:hover .brand-logo{transform:scale(1.07)}
+.brand-logo img{width:100%;height:100%;object-fit:contain}
+.brand-name{font-family:var(--font-display);font-weight:800;font-size:20px;letter-spacing:-0.04em}
+.badge-beta{font-family:var(--font-mono);font-size:10px;font-weight:600;color:var(--text-secondary);background:rgba(255,255,255,0.05);border:1px solid var(--border-subtle);padding:2px 7px;border-radius:999px}
+.navbar{position:sticky;top:12px;z-index:50;background:rgba(12,12,15,0.94);border:1px solid var(--border-subtle);box-shadow:inset 0 1px 0 rgba(255,255,255,0.08),0 14px 36px rgba(0,0,0,0.78);border-radius:20px;padding:10px 14px;display:flex;align-items:center;justify-content:space-between}
+.icon-btn{width:38px;height:38px;border-radius:12px;border:1px solid transparent;background:transparent;color:var(--text-primary);display:inline-flex;align-items:center;justify-content:center;cursor:pointer;transition:background 0.2s}
+.icon-btn:hover{background:rgba(255,255,255,0.06)}
+.drawer-backdrop{position:fixed;inset:0;background:rgba(0,0,0,0.76);z-index:60;opacity:0;pointer-events:none;transition:opacity 0.25s}
+.drawer-backdrop.open{opacity:1;pointer-events:auto}
+.drawer-panel{position:fixed;top:12px;left:16px;right:16px;max-width:508px;margin:0 auto;background:#101014;border:1px solid var(--border-rim);box-shadow:0 28px 70px rgba(0,0,0,0.9);border-radius:22px;padding:14px 16px 18px;z-index:70;transform:translate3d(0,-16px,0) scale(0.97);opacity:0;pointer-events:none;transition:transform 0.32s var(--ease-spring),opacity 0.22s}
+.drawer-panel.open{transform:translate3d(0,0,0) scale(1);opacity:1;pointer-events:auto}
+.drawer-links{display:flex;flex-direction:column;padding:8px 0 14px}
+.drawer-link{display:flex;align-items:center;justify-content:space-between;padding:13px 10px;color:var(--text-primary);font-size:15px;font-weight:500;border-radius:10px;cursor:pointer;transition:background 0.15s}
+.drawer-link:hover{background:rgba(255,255,255,0.05)}
+.drawer-link span:last-child{color:var(--text-secondary);font-size:14px}
+.view-section{display:none;animation:viewFadeIn 0.36s var(--ease-spring) forwards}
+.view-section.active{display:block}
+@keyframes viewFadeIn{from{opacity:0;transform:translate3d(0,10px,0)}to{opacity:1;transform:translate3d(0,0,0)}}
+.hero{text-align:center;padding:40px 4px 24px}
+.hero-title{font-family:var(--font-display);font-size:clamp(40px,10vw,58px);font-weight:800;line-height:1.04;letter-spacing:-0.04em;background:linear-gradient(180deg,#fff 30%,#a1a1aa 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:18px}
+.hero-subtitle{font-size:15.5px;line-height:1.6;color:var(--text-secondary);max-width:440px;margin:0 auto 28px}
+.btn{position:relative;overflow:hidden;display:inline-flex;align-items:center;justify-content:center;gap:8px;width:100%;padding:14px 20px;border-radius:14px;font-family:var(--font-sans);font-size:15px;font-weight:600;cursor:pointer;border:1px solid transparent;transition:transform 0.2s var(--ease-spring),background-color 0.2s,box-shadow 0.2s;text-decoration:none}
+.btn:active{transform:scale(0.96)}
+.btn-primary{background:linear-gradient(180deg,#fff 0%,#e4e4e8 100%);color:#09090b;box-shadow:inset 0 1px 0 #fff,0 6px 24px rgba(255,255,255,0.14)}
+.btn-primary:hover{transform:translateY(-1px);box-shadow:inset 0 1px 0 #fff,0 10px 30px rgba(255,255,255,0.22)}
+.btn-danger{background:var(--accent-red);color:#fff;box-shadow:inset 0 1px 0 rgba(255,255,255,0.2),0 6px 24px rgba(229,9,20,0.3)}
+.btn-danger:hover{transform:translateY(-1px);box-shadow:inset 0 1px 0 rgba(255,255,255,0.3),0 10px 30px rgba(229,9,20,0.5)}
+.btn[disabled]{opacity:.55;cursor:not-allowed}
+.card{position:relative;background:linear-gradient(180deg,var(--bg-card-top) 0%,var(--bg-card) 100%);border:1px solid var(--border-subtle);box-shadow:inset 0 1px 0 rgba(255,255,255,0.06),0 10px 30px rgba(0,0,0,0.45);border-radius:var(--radius-xl);padding:18px;margin-bottom:14px}
+.tilt-3d{will-change:transform;transition:transform 0.18s var(--ease-out)}
+.window-bar{display:flex;align-items:center;justify-content:space-between;padding-bottom:14px;margin-bottom:16px;border-bottom:1px solid var(--border-subtle)}
+.window-dots span{width:9px;height:9px;border-radius:50%;background:rgba(255,255,255,0.14)}
+.window-path{font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)}
+.field{margin-bottom:18px;text-align:left}
+.field label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:8px;text-transform:uppercase;letter-spacing:0.06em}
+.input,.select{width:100%;padding:14px 16px;background:var(--bg-terminal);border:1px solid var(--border-subtle);border-radius:12px;color:var(--text-primary);font-size:14px;outline:none;transition:border-color 0.2s,box-shadow 0.2s}
+.input:focus,.select:focus{border-color:rgba(229,9,20,0.5);box-shadow:0 0 0 3px rgba(229,9,20,0.15)}
+select.select{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%238e8e9a' stroke-width='2' fill='none'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 14px center}
+.segmented-control{position:relative;display:grid;grid-template-columns:1fr 1fr;background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:16px;padding:4px;margin-bottom:14px}
+.segmented-thumb{position:absolute;top:4px;bottom:4px;left:4px;width:calc(50% - 4px);background:linear-gradient(180deg,#fff,#e4e4e8);box-shadow:0 2px 12px rgba(255,255,255,0.15);border-radius:12px;transition:transform 0.32s var(--ease-spring);z-index:1}
+.segmented-control[data-active="standard"] .segmented-thumb{transform:translate3d(100%,0,0)}
+.segment-btn{position:relative;z-index:2;background:transparent;border:none;padding:11px 12px;font-family:var(--font-sans);font-size:14px;font-weight:600;color:var(--text-secondary);cursor:pointer;transition:color 0.2s}
+.segment-btn.active{color:#09090b}
+.link-result{margin-top:20px;padding:20px;border-radius:12px;background:rgba(34,197,94,0.08);border:1px solid rgba(34,197,94,0.3);display:none;animation:slideUp 0.4s var(--ease-spring);text-align:left}
+@keyframes slideUp{from{opacity:0;transform:translateY(15px)}to{opacity:1;transform:translateY(0)}}
+.link-result.show{display:block}
+.link-result h4{margin:0 0 12px;font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:var(--accent-green);display:flex;align-items:center;gap:6px}
+.link-result h4::before{content:'✓';display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;background:var(--accent-green);color:#000;border-radius:50%;font-size:11px}
+.lr-link{display:flex;gap:8px}
+.lr-link code{flex:1;padding:12px;background:#000;border:1px solid var(--border-subtle);border-radius:8px;font-family:var(--font-mono);font-size:12px;color:var(--accent-green);overflow-x:auto;white-space:nowrap;display:flex;align-items:center}
+.link-meta{margin-top:12px;font-size:12.5px;color:var(--text-secondary);line-height:1.6}
+.link-meta strong{color:#fff}
+.admin-table{width:100%;border-collapse:collapse;font-size:12px;text-align:left}
+.admin-table th{background:rgba(0,0,0,0.3);color:var(--text-secondary);padding:10px 8px;border-bottom:1px solid var(--border-subtle);text-transform:uppercase;font-size:10px}
+.admin-table td{padding:10px 8px;border-bottom:1px solid var(--border-subtle)}
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:600}
+.badge.active{background:rgba(34,197,94,0.15);color:var(--accent-green)}
+.badge.revoked{background:rgba(255,107,107,0.15);color:#ff6b6b}
+.key-reveal{background:rgba(34,197,94,0.1);border:1px solid var(--accent-green);padding:12px;border-radius:8px;margin-top:12px;font-family:var(--font-mono);color:var(--accent-green);font-size:12px;word-break:break-all}
+.reveal{opacity:0;transform:translate3d(0,18px,0);transition:opacity 0.55s var(--ease-spring),transform 0.55s var(--ease-spring)}
+.reveal.visible{opacity:1;transform:translate3d(0,0,0)}
+</style>
 </head>
 <body>
-  <div class="ambient-bg"></div>
+<div class="ambient-bg"></div>
 
-  <div class="drawer-backdrop" id="drawerBackdrop" onclick="toggleDrawer(false)"></div>
-  <div class="drawer-panel" id="drawerPanel">
-    <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--border-subtle); padding-bottom:12px; margin-bottom:12px;">
-      <div class="brand" onclick="switchView('landing'); toggleDrawer(false)">
-        <div class="brand-logo"><img src="https://bi-jingo.com/wp-content/uploads/2009/03/netflix-logo-png-clip-art.png" alt="Logo" /></div>
-        <span class="brand-name">Netflix</span>
-      </div>
-      <button class="icon-btn" onclick="toggleDrawer(false)">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
-      </button>
+<div class="drawer-backdrop" id="drawerBackdrop" onclick="toggleDrawer(false)"></div>
+<div class="drawer-panel" id="drawerPanel">
+  <div style="display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border-subtle);padding-bottom:12px;margin-bottom:12px;">
+    <div class="brand" onclick="switchView('landing');toggleDrawer(false)">
+      <div class="brand-logo"><img src="https://bi-jingo.com/wp-content/uploads/2009/03/netflix-logo-png-clip-art.png" alt="Logo"></div>
+      <span class="brand-name">Netflix</span>
     </div>
-    <div class="drawer-links">
-      <a class="drawer-link" onclick="switchView('landing'); toggleDrawer(false)"><span>Home</span><span>&rarr;</span></a>
-      <a class="drawer-link" onclick="attemptAdminAccess(); toggleDrawer(false)"><span>Admin Panel</span><span>&rarr;</span></a>
-    </div>
+    <button class="icon-btn" onclick="toggleDrawer(false)"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
   </div>
+  <div class="drawer-links">
+    <a class="drawer-link" onclick="switchView('landing');toggleDrawer(false)"><span>Home</span><span>&rarr;</span></a>
+    <a class="drawer-link" onclick="attemptAdminAccess();toggleDrawer(false)"><span>Admin Panel</span><span>&rarr;</span></a>
+  </div>
+</div>
 
-  <div class="container">
-    <header class="navbar">
-      <div class="brand" onclick="switchView('landing')">
-        <div class="brand-logo"><img src="https://bi-jingo.com/wp-content/uploads/2009/03/netflix-logo-png-clip-art.png" alt="Logo" /></div>
-        <span class="brand-name">Netflix</span>
-        <span class="badge-beta">GEN</span>
-      </div>
-      <button class="icon-btn" onclick="toggleDrawer(true)">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
-      </button>
-    </header>
+<div class="container">
+  <header class="navbar">
+    <div class="brand" onclick="switchView('landing')">
+      <div class="brand-logo"><img src="https://bi-jingo.com/wp-content/uploads/2009/03/netflix-logo-png-clip-art.png" alt="Logo"></div>
+      <span class="brand-name">Netflix</span>
+      <span class="badge-beta">GEN</span>
+    </div>
+    <button class="icon-btn" onclick="toggleDrawer(true)">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+    </button>
+  </header>
 
-    <!-- VIEW: LANDING -->
-    <main id="view-landing" class="view-section active">
-      <section class="hero">
-        <h1 class="hero-title">Premium Link<br>Generator.</h1>
-        <p class="hero-subtitle">Get a live Netflix login link instantly. Select your region and plan below.</p>
-      </section>
-
-      <div class="card tilt-3d" style="max-width:640px; margin:0 auto;">
-        <div class="window-bar">
-          <div class="window-dots" style="display:flex; gap:6px;"><span></span><span></span><span></span></div>
-          <div class="window-path">cuddleflix / generator</div>
-        </div>
-
-        <div class="field">
-          <label>Plan</label>
-          <div class="segmented-control" id="planSwitch" data-active="premium">
-            <div class="segmented-thumb"></div>
-            <button class="segment-btn active" id="tab-premium" onclick="selectPlan('premium')">Premium</button>
-            <button class="segment-btn" id="tab-standard" onclick="selectPlan('standard')">Standard</button>
-          </div>
-        </div>
-
-        <div class="field">
-          <label>Region</label>
-          <select class="select" id="countrySelect">
-            <option value="">Any Country</option>
-            <option value="US">🇺🇸 United States</option>
-            <option value="GB">🇬🇧 United Kingdom</option>
-            <option value="BR">🇧🇷 Brazil</option>
-            <option value="IN">🇮🇳 India</option>
-            <option value="CA">🇨🇦 Canada</option>
-            <option value="AU">🇦🇺 Australia</option>
-            <option value="DE">🇩🇪 Germany</option>
-            <option value="FR">🇫🇷 France</option>
-            <option value="JP">🇯🇵 Japan</option>
-            <option value="KR">🇰🇷 South Korea</option>
-          </select>
-        </div>
-
-        <button class="btn btn-danger" id="genBtn" onclick="generateLink()" style="margin-top:8px;">Generate Link Now &rarr;</button>
-
-        <div class="link-result" id="result">
-          <h4>Link Generated</h4>
-          <div class="lr-link">
-            <code id="linkOut"></code>
-            <button class="btn" style="width:auto; padding:8px 14px; font-size:12px;" onclick="copyLink()">Copy</button>
-          </div>
-          <div class="link-meta" id="metaOut"></div>
-          <a class="btn btn-primary" style="margin-top:16px; text-decoration:none;" id="redirectBtn" href="#" target="_blank">Open Netflix &nearr;</a>
-        </div>
-        
-        <div style="margin-top:24px; text-align:center; border-top:1px solid var(--border-subtle); padding-top:20px;">
-          <p style="font-size:13px; color:var(--text-secondary); margin-bottom:12px;">Want API access for your own app?</p>
-          <a href="https://t.me/STYGOS" target="_blank" class="btn btn-primary" style="text-decoration:none;">Contact @STYGOS on Telegram &nearr;</a>
-        </div>
-      </div>
-
-      <!-- 3D ENGINE CUBE -->
-      <section class="cube-showcase reveal" id="cubeSection" style="margin-top:40px;">
-        <div class="eyebrow" style="margin-bottom:6px; font-family:var(--font-mono); font-size:11px; letter-spacing:.14em; text-transform:uppercase; color:var(--text-secondary);">Core Architecture</div>
-        <h2 class="font-display" style="font-size:24px; font-weight:700; letter-spacing:-0.03em; margin-bottom:6px;">Isolated Cookie Pools</h2>
-        <p style="font-size:13.5px; color:var(--text-secondary);">Drag the cube or select a region to inspect live filters.</p>
-
-        <div class="cube-stage" id="cubeStage">
-          <div class="cube-3d" id="cube3d">
-            <div class="cube-face face-front">
-              <span class="cube-face-tag">Region 01</span>
-              <div class="cube-face-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg></div>
-              <div class="cube-face-title">United States</div>
-              <div class="cube-face-sub">🇺🇸 US</div>
-            </div>
-            <div class="cube-face face-right">
-              <span class="cube-face-tag">Region 02</span>
-              <div class="cube-face-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></div>
-              <div class="cube-face-title">Brazil</div>
-              <div class="cube-face-sub">🇧🇷 BR</div>
-            </div>
-            <div class="cube-face face-back">
-              <span class="cube-face-tag">Region 03</span>
-              <div class="cube-face-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></div>
-              <div class="cube-face-title">India</div>
-              <div class="cube-face-sub">🇮🇳 IN</div>
-            </div>
-            <div class="cube-face face-left">
-              <span class="cube-face-tag">Region 04</span>
-              <div class="cube-face-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></div>
-              <div class="cube-face-title">United Kingdom</div>
-              <div class="cube-face-sub">🇬🇧 GB</div>
-            </div>
-            <div class="cube-face face-top">
-              <span class="cube-face-tag">Plan 01</span>
-              <div class="cube-face-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg></div>
-              <div class="cube-face-title">Premium 4K</div>
-              <div class="cube-face-sub">Premium</div>
-            </div>
-            <div class="cube-face face-bottom">
-              <span class="cube-face-tag">Plan 02</span>
-              <div class="cube-face-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="5" width="18" height="14" rx="4"/></svg></div>
-              <div class="cube-face-title">Standard HD</div>
-              <div class="cube-face-sub">Standard</div>
-            </div>
-          </div>
-        </div>
-
-        <div class="cube-pills" id="cubePills">
-          <button class="cube-pill-btn active" onclick="snapCubeTo(-14, 0, this)">US</button>
-          <button class="cube-pill-btn" onclick="snapCubeTo(-14, -90, this)">BR</button>
-          <button class="cube-pill-btn" onclick="snapCubeTo(-14, -180, this)">IN</button>
-          <button class="cube-pill-btn" onclick="snapCubeTo(-14, 90, this)">GB</button>
-          <button class="cube-pill-btn" onclick="snapCubeTo(-90, 0, this)">Premium</button>
-          <button class="cube-pill-btn" onclick="snapCubeTo(90, 0, this)">Standard</button>
-        </div>
-      </section>
-    </main>
-
-    <!-- VIEW: ADMIN PANEL -->
-    <section id="view-admin" class="view-section">
-      <div style="margin-top:16px;">
-        <div class="card">
-          <div style="display:flex; justify-content:space-between; align-items:center;">
-            <div>
-              <h1 style="font-family:var(--font-display); font-size:24px; font-weight:800;">Admin Panel</h1>
-              <p style="font-size:13px; color:var(--text-secondary); margin-top:4px;">Manage your pool and keys</p>
-            </div>
-            <button class="btn btn-danger" style="width:auto; padding:8px 12px; font-size:12px;" onclick="switchView('landing')">Lock</button>
-          </div>
-        </div>
-
-        <div class="card">
-          <label style="font-size:12px; text-transform:uppercase; color:var(--text-secondary); margin-bottom:8px; display:block;">API Keys</label>
-          <div style="display:flex; gap:8px; margin-bottom:12px;">
-            <input type="text" class="input" id="newKeyLabel" placeholder="Label (e.g. app)" style="flex:1;">
-            <button class="btn btn-primary" style="width:auto;" onclick="mintKey()">Mint</button>
-          </div>
-          <div id="keyReveal" class="key-reveal" style="display:none;"></div>
-          <table class="admin-table" style="margin-top:12px;">
-            <thead><tr><th>Label</th><th>Prefix</th><th>Status</th><th>Action</th></tr></thead>
-            <tbody id="keyTableBody"></tbody>
-          </table>
-        </div>
-
-        <div class="card">
-          <label style="font-size:12px; text-transform:uppercase; color:var(--text-secondary); margin-bottom:8px; display:block;">Upload Cookies</label>
-          <div class="field">
-            <input type="file" class="input" id="uploadFiles" multiple accept=".txt,.json" style="font-family:var(--font-sans); font-size:13px;">
-          </div>
-          <button class="btn btn-primary" style="width:100%;" onclick="uploadCookies()">Import Cookies</button>
-          <div id="uploadResult" style="margin-top:12px; font-size:12px; color:var(--accent-green);"></div>
-        </div>
-
-        <!-- BULK CHECKER CARD -->
-        <div class="card">
-          <label style="font-size:12px; text-transform:uppercase; color:var(--text-secondary); margin-bottom:8px; display:block;">Bulk Checker</label>
-          <div class="field">
-            <label style="font-size:11px; margin-bottom:4px;">Proxies (one per line, optional)</label>
-            <textarea class="input" id="proxyInput" placeholder="ip:port&#10;user:pass@ip:port" style="height:80px; font-family:var(--font-mono); font-size:12px;"></textarea>
-          </div>
-          <button class="btn btn-primary" id="startCheckBtn" style="width:100%;" onclick="startChecker()">Start Background Check</button>
-          <div id="checkerStats" style="margin-top:12px; font-size:12px; color:var(--text-secondary); display:none;">
-            <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
-              <span>Progress:</span> <span id="chkProgress">0 / 0</span>
-            </div>
-            <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
-              <span>Kept:</span> <span id="chkKept" style="color:var(--accent-green);">0</span>
-            </div>
-            <div style="display:flex; justify-content:space-between;">
-              <span>Deleted:</span> <span id="chkDeleted" style="color:#ff6b6b;">0</span>
-            </div>
-          </div>
-          <div id="checkerLog" style="margin-top:12px; max-height:150px; overflow-y:auto; background:#000; padding:8px; border-radius:6px; font-family:var(--font-mono); font-size:11px; color:var(--text-secondary); display:none;"></div>
-        </div>
-
-        <div class="card" style="padding:0; overflow-x:auto;">
-          <div style="padding:16px; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--border-subtle);">
-            <h3 style="font-family:var(--font-display); font-weight:700; font-size:15px;">Cookie Pool</h3>
-            <button class="btn btn-danger" style="width:auto; padding:6px 10px; font-size:11px;" onclick="deleteAll()">Delete All</button>
-          </div>
-          <table class="admin-table">
-            <thead><tr><th>#</th><th>Plan</th><th>Country</th><th>Email</th><th>Fails</th><th>Status</th><th>Action</th></tr></thead>
-            <tbody id="cookieTableBody"></tbody>
-          </table>
-        </div>
-      </div>
+  <main id="view-landing" class="view-section active">
+    <section class="hero">
+      <h1 class="hero-title">Premium Link<br>Generator.</h1>
+      <p class="hero-subtitle">Get a live Netflix login link instantly. Select your region and plan below.</p>
     </section>
-  </div>
+    <div class="card tilt-3d" style="max-width:640px;margin:0 auto;">
+      <div class="window-bar">
+        <div class="window-dots" style="display:flex;gap:6px;"><span></span><span></span><span></span></div>
+        <div class="window-path">cuddleflix / generator</div>
+      </div>
+      <div class="field">
+        <label>Plan</label>
+        <div class="segmented-control" id="planSwitch" data-active="premium">
+          <div class="segmented-thumb"></div>
+          <button class="segment-btn active" id="tab-premium" onclick="selectPlan('premium')">Premium</button>
+          <button class="segment-btn" id="tab-standard" onclick="selectPlan('standard')">Standard</button>
+        </div>
+      </div>
+      <div class="field">
+        <label>Region</label>
+        <select class="select" id="countrySelect">
+          <option value="">Any Country</option>
+          <option value="US">🇺🇸 United States</option>
+          <option value="GB">🇬🇧 United Kingdom</option>
+          <option value="BR">🇧🇷 Brazil</option>
+          <option value="IN">🇮🇳 India</option>
+          <option value="CA">🇨🇦 Canada</option>
+          <option value="AU">🇦🇺 Australia</option>
+          <option value="DE">🇩🇪 Germany</option>
+          <option value="FR">🇫🇷 France</option>
+          <option value="JP">🇯🇵 Japan</option>
+          <option value="KR">🇰🇷 South Korea</option>
+        </select>
+      </div>
+      <button class="btn btn-danger" id="genBtn" onclick="generateLink()" style="margin-top:8px;">Generate Link Now &rarr;</button>
+      <div class="link-result" id="result">
+        <h4>Link Generated</h4>
+        <div class="lr-link">
+          <code id="linkOut"></code>
+          <button class="btn" style="width:auto;padding:8px 14px;font-size:12px;" onclick="copyLink()">Copy</button>
+        </div>
+        <div class="link-meta" id="metaOut"></div>
+        <a class="btn btn-primary" style="margin-top:16px;text-decoration:none;" id="redirectBtn" href="#" target="_blank">Open Netflix &nearr;</a>
+      </div>
+      <div style="margin-top:24px;text-align:center;border-top:1px solid var(--border-subtle);padding-top:20px;">
+        <p style="font-size:13px;color:var(--text-secondary);margin-bottom:12px;">Want API access for your own app?</p>
+        <a href="https://t.me/STYGOS" target="_blank" class="btn btn-primary" style="text-decoration:none;">Contact @STYGOS on Telegram &nearr;</a>
+      </div>
+    </div>
+  </main>
 
-  <script>
-    let currentPlan = 'premium';
-    let currentNonce = '';
-    let adminPass = '';
+  <section id="view-admin" class="view-section">
+    <div style="margin-top:16px;">
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <div>
+            <h1 style="font-family:var(--font-display);font-size:24px;font-weight:800;">Admin Panel</h1>
+            <p style="font-size:13px;color:var(--text-secondary);margin-top:4px;">Manage your pool and keys</p>
+          </div>
+          <button class="btn btn-danger" style="width:auto;padding:8px 12px;font-size:12px;" onclick="switchView('landing')">Lock</button>
+        </div>
+      </div>
 
-    async function fetchNonce() {
-      try {
-        const res = await fetch('/api/public-challenge');
-        if (res.ok) {
-          const data = await res.json();
-          currentNonce = data.nonce;
-        }
-      } catch (err) {}
-    }
-    fetchNonce();
+      <div class="card">
+        <label style="font-size:12px;text-transform:uppercase;color:var(--text-secondary);margin-bottom:8px;display:block;">API Keys</label>
+        <div style="display:flex;gap:8px;margin-bottom:12px;">
+          <input type="text" class="input" id="newKeyLabel" placeholder="Label" style="flex:1;">
+          <button class="btn btn-primary" style="width:auto;" onclick="mintKey()">Mint</button>
+        </div>
+        <div id="keyReveal" class="key-reveal" style="display:none;"></div>
+        <table class="admin-table" style="margin-top:12px;">
+          <thead><tr><th>Label</th><th>Prefix</th><th>Status</th><th>Action</th></tr></thead>
+          <tbody id="keyTableBody"></tbody>
+        </table>
+      </div>
 
-    function switchView(name) {
-      document.querySelectorAll('.view-section').forEach(v => v.classList.remove('active'));
-      document.getElementById('view-' + name).classList.add('active');
-      window.scrollTo({ top: 0, behavior: 'smooth' });
-    }
-    function toggleDrawer(open) {
-      document.getElementById('drawerBackdrop').classList.toggle('open', open);
-      document.getElementById('drawerPanel').classList.toggle('open', open);
-    }
-    function selectPlan(plan) {
-      currentPlan = plan;
-      document.getElementById('planSwitch').setAttribute('data-active', plan);
-      document.getElementById('tab-premium').classList.toggle('active', plan === 'premium');
-      document.getElementById('tab-standard').classList.toggle('active', plan === 'standard');
-    }
+      <div class="card">
+        <label style="font-size:12px;text-transform:uppercase;color:var(--text-secondary);margin-bottom:8px;display:block;">Upload Cookies</label>
+        <div class="field">
+          <input type="file" class="input" id="uploadFiles" multiple accept=".txt,.json" style="font-family:var(--font-sans);font-size:13px;">
+        </div>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:12px;">
+          <input type="checkbox" id="checkBeforeImport" style="width:18px;height:18px;">
+          <span style="font-size:12px;color:var(--text-secondary);">Check cookies before import (skip dead)</span>
+        </label>
+        <div class="field" id="importProxyField" style="display:none;">
+          <label style="font-size:11px;margin-bottom:4px;">Proxies (optional, one per line)</label>
+          <textarea class="input" id="importProxyInput" placeholder="ip:port:user:pass" style="height:60px;font-family:var(--font-mono);font-size:12px;"></textarea>
+        </div>
+        <button class="btn btn-primary" id="uploadBtn" style="width:100%;" onclick="uploadCookies()">Import Cookies</button>
+        <div id="uploadResult" style="margin-top:12px;font-size:12px;color:var(--accent-green);"></div>
+      </div>
 
-    async function generateLink() {
-      const country = document.getElementById('countrySelect').value;
-      const btn = document.getElementById('genBtn');
-      const resultBox = document.getElementById('result');
-      
-      if (!currentNonce) {
-        await fetchNonce();
-        if (!currentNonce) return alert('Verification failed. Please refresh.');
-      }
+      <div class="card">
+        <label style="font-size:12px;text-transform:uppercase;color:var(--text-secondary);margin-bottom:8px;display:block;">Bulk Checker</label>
+        <div class="field">
+          <label style="font-size:11px;margin-bottom:4px;">Proxies (one per line, optional)</label>
+          <textarea class="input" id="proxyInput" placeholder="ip:port:user:pass" style="height:80px;font-family:var(--font-mono);font-size:12px;"></textarea>
+        </div>
+        <button class="btn btn-primary" id="startCheckBtn" style="width:100%;" onclick="startChecker()">Start Background Check</button>
+        <div id="checkerStats" style="margin-top:12px;font-size:12px;color:var(--text-secondary);display:none;">
+          <div style="display:flex;justify-content:space-between;margin-bottom:4px;"><span>Progress:</span><span id="chkProgress">0 / 0</span></div>
+          <div style="display:flex;justify-content:space-between;margin-bottom:4px;"><span>Kept:</span><span id="chkKept" style="color:var(--accent-green);">0</span></div>
+          <div style="display:flex;justify-content:space-between;"><span>Deleted:</span><span id="chkDeleted" style="color:#ff6b6b;">0</span></div>
+        </div>
+        <div id="checkerLog" style="margin-top:12px;max-height:150px;overflow-y:auto;background:#000;padding:8px;border-radius:6px;font-family:var(--font-mono);font-size:11px;color:var(--text-secondary);display:none;"></div>
+      </div>
 
-      btn.disabled = true;
-      btn.innerHTML = 'Generating...';
-      resultBox.classList.remove('show');
+      <div class="card" style="padding:0;overflow-x:auto;">
+        <div style="padding:16px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border-subtle);">
+          <h3 style="font-family:var(--font-display);font-weight:700;font-size:15px;">Cookie Pool</h3>
+          <button class="btn btn-danger" style="width:auto;padding:6px 10px;font-size:11px;" onclick="deleteAll()">Delete All</button>
+        </div>
+        <table class="admin-table">
+          <thead><tr><th>#</th><th>Plan</th><th>Country</th><th>Email</th><th>Fails</th><th>Status</th><th>Action</th></tr></thead>
+          <tbody id="cookieTableBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+</div>
 
-      try {
-        const res = await fetch('/api/public-generate', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            plan: currentPlan,
-            country: country,
-            nonce: currentNonce
-          })
-        });
-        
-        const data = await res.json();
-        if (!data.ok) throw new Error(data.error || 'Generation failed');
+<script>
+let currentPlan = 'premium';
+let currentNonce = '';
+let adminPass = '';
 
-        document.getElementById('linkOut').textContent = data.url;
-        document.getElementById('metaOut').innerHTML = `<strong>${data.account.plan.toUpperCase()}</strong> · ${data.account.country || 'Any'}<br>${data.account.email || 'Account'}<br>Credit: STYFAIR`;
-        document.getElementById('redirectBtn').href = data.url;
-        resultBox.classList.add('show');
-        
-        currentNonce = '';
-        fetchNonce();
-      } catch (err) {
-        alert(err.message);
-      } finally {
-        btn.disabled = false;
-        btn.innerHTML = 'Generate Link Now &rarr;';
-      }
-    }
+document.getElementById('checkBeforeImport').addEventListener('change', (e) => {
+  document.getElementById('importProxyField').style.display = e.target.checked ? 'block' : 'none';
+});
 
-    function copyLink() {
-      const text = document.getElementById('linkOut').textContent;
-      navigator.clipboard.writeText(text);
-    }
+async function fetchNonce() {
+  try {
+    const res = await fetch('/api/public-challenge');
+    if (res.ok) { const d = await res.json(); currentNonce = d.nonce; }
+  } catch {}
+}
+fetchNonce();
 
-    async function attemptAdminAccess() {
-      const pass = prompt("Enter panel password:");
-      if (!pass) return;
+function switchView(name) {
+  document.querySelectorAll('.view-section').forEach(v => v.classList.remove('active'));
+  document.getElementById('view-' + name).classList.add('active');
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+function toggleDrawer(open) {
+  document.getElementById('drawerBackdrop').classList.toggle('open', open);
+  document.getElementById('drawerPanel').classList.toggle('open', open);
+}
+function selectPlan(p) {
+  currentPlan = p;
+  document.getElementById('planSwitch').setAttribute('data-active', p);
+  document.getElementById('tab-premium').classList.toggle('active', p === 'premium');
+  document.getElementById('tab-standard').classList.toggle('active', p === 'standard');
+}
 
-      try {
-        const res = await fetch('/api/admin/verify', {
-          headers: { 'X-Admin-Pass': pass }
-        });
-        
-        if (res.ok) {
-          adminPass = pass;
-          switchView('admin');
-          loadAdminData();
-        } else {
-          alert("Incorrect password.");
-        }
-      } catch (err) {
-        alert("Connection failed.");
-      }
-    }
+async function generateLink() {
+  const country = document.getElementById('countrySelect').value;
+  const btn = document.getElementById('genBtn');
+  const box = document.getElementById('result');
+  if (!currentNonce) { await fetchNonce(); if (!currentNonce) return alert('Refresh'); }
+  btn.disabled = true; btn.textContent = 'Generating...';
+  box.classList.remove('show');
+  try {
+    const res = await fetch('/api/public-generate', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ plan: currentPlan, country, nonce: currentNonce })
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.error || 'Failed');
+    document.getElementById('linkOut').textContent = data.url;
+    document.getElementById('metaOut').innerHTML =
+      `<strong>${data.account.plan.toUpperCase()}</strong> · ${data.account.country || 'Any'}<br>${data.account.email || 'Account'}<br>Credit: STYFAIR`;
+    document.getElementById('redirectBtn').href = data.url;
+    box.classList.add('show');
+    currentNonce = ''; fetchNonce();
+  } catch (e) { alert(e.message); }
+  finally { btn.disabled = false; btn.innerHTML = 'Generate Link Now &rarr;'; }
+}
+function copyLink() { navigator.clipboard.writeText(document.getElementById('linkOut').textContent); }
 
-    async function loadAdminData() {
-      const keysRes = await fetch('/api/admin/keys', { headers: { 'X-Admin-Pass': adminPass } });
-      const keys = await keysRes.json();
-      document.getElementById('keyTableBody').innerHTML = keys.map(k => `
-        <tr>
-          <td>${k.label}</td>
-          <td><code>${k.key_prefix}</code></td>
-          <td><span class="badge ${k.revoked ? 'revoked' : 'active'}">${k.revoked ? 'Revoked' : 'Active'}</span></td>
-          <td>${!k.revoked ? `<button class="btn btn-sm" style="padding:4px 8px; font-size:11px;" onclick="revokeKey(${k.id})">Revoke</button>` : ''}</td>
-        </tr>
-      `).join('');
+async function attemptAdminAccess() {
+  const pass = prompt("Enter panel password:");
+  if (!pass) return;
+  try {
+    const res = await fetch('/api/admin/verify', { headers: {'X-Admin-Pass': pass} });
+    if (res.ok) { adminPass = pass; switchView('admin'); loadAdminData(); resumeChecker(); }
+    else alert("Incorrect password.");
+  } catch { alert("Connection failed."); }
+}
 
-      const cookiesRes = await fetch('/api/admin/cookies', { headers: { 'X-Admin-Pass': adminPass } });
-      const cookies = await cookiesRes.json();
-      document.getElementById('cookieTableBody').innerHTML = cookies.map(c => `
-        <tr>
-          <td>${c.id}</td>
-          <td><span class="badge ${c.deleted ? 'revoked' : 'active'}">${c.meta.plan || 'Unknown'}</span></td>
-          <td>${c.meta.country || '—'}</td>
-          <td>${c.meta.email || '—'}</td>
-          <td>${c.fail_count}</td>
-          <td>${c.deleted ? 'Evicted' : 'Healthy'}</td>
-          <td><button class="btn btn-sm" style="padding:4px 8px; font-size:11px; color:#ff6b6b;" onclick="deleteCookie(${c.id})">Delete</button></td>
-        </tr>
-      `).join('');
-    }
+async function loadAdminData() {
+  const keys = await (await fetch('/api/admin/keys', {headers:{'X-Admin-Pass':adminPass}})).json();
+  document.getElementById('keyTableBody').innerHTML = keys.map(k => `
+    <tr><td>${k.label}</td><td><code>${k.key_prefix}</code></td>
+    <td><span class="badge ${k.revoked?'revoked':'active'}">${k.revoked?'Revoked':'Active'}</span></td>
+    <td>${!k.revoked?`<button class="btn" style="padding:4px 8px;font-size:11px;" onclick="revokeKey(${k.id})">Revoke</button>`:''}</td></tr>`).join('');
 
-    async function mintKey() {
-      const label = document.getElementById('newKeyLabel').value || 'new-key';
-      const res = await fetch('/api/admin/keys', {
-        method: 'POST',
-        headers: { 'X-Admin-Pass': adminPass, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ label })
-      });
-      const data = await res.json();
-      if (data.ok) {
-        document.getElementById('keyReveal').style.display = 'block';
-        document.getElementById('keyReveal').textContent = 'COPY THIS NOW: ' + data.raw;
-        document.getElementById('newKeyLabel').value = '';
-        loadAdminData();
-      }
-    }
+  const cookies = await (await fetch('/api/admin/cookies', {headers:{'X-Admin-Pass':adminPass}})).json();
+  document.getElementById('cookieTableBody').innerHTML = cookies.map(c => `
+    <tr><td>${c.id}</td>
+    <td><span class="badge ${c.deleted?'revoked':'active'}">${c.meta.plan||'Unknown'}</span></td>
+    <td>${c.meta.country||'—'}</td><td>${c.meta.email||'—'}</td><td>${c.fail_count}</td>
+    <td>${c.deleted?'Evicted':'Healthy'}</td>
+    <td><button class="btn" style="padding:4px 8px;font-size:11px;color:#ff6b6b;" onclick="deleteCookie(${c.id})">Delete</button></td></tr>`).join('');
+}
 
-    async function uploadCookies() {
-      const files = document.getElementById('uploadFiles').files;
-      if (!files.length) return alert('Select files first');
-      
-      const btn = document.querySelector('button[onclick="uploadCookies()"]');
-      btn.disabled = true; btn.textContent = "Uploading...";
+async function mintKey() {
+  const label = document.getElementById('newKeyLabel').value || 'new-key';
+  const data = await (await fetch('/api/admin/keys', {
+    method: 'POST', headers: {'X-Admin-Pass':adminPass,'Content-Type':'application/json'},
+    body: JSON.stringify({label})
+  })).json();
+  if (data.ok) {
+    document.getElementById('keyReveal').style.display = 'block';
+    document.getElementById('keyReveal').textContent = 'COPY NOW: ' + data.raw;
+    document.getElementById('newKeyLabel').value = '';
+    loadAdminData();
+  }
+}
 
-      const formData = new FormData();
-      for (let f of files) formData.append('files', f);
-      
-      const res = await fetch('/api/admin/bulk', {
-        method: 'POST',
-        headers: { 'X-Admin-Pass': adminPass },
-        body: formData
-      });
-      const data = await res.json();
-      if (data.ok) {
-        document.getElementById('uploadResult').textContent = `Added: ${data.added} | Dupes: ${data.dupes}`;
-        loadAdminData();
-      }
-      btn.disabled = false; btn.textContent = "Import Cookies";
-    }
-
-    async function revokeKey(id) {
-      await fetch('/api/admin/keys/revoke', { method: 'POST', headers: { 'X-Admin-Pass': adminPass, 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) });
+async function uploadCookies() {
+  const files = document.getElementById('uploadFiles').files;
+  if (!files.length) return alert('Select files first');
+  const check = document.getElementById('checkBeforeImport').checked;
+  const proxy = document.getElementById('importProxyInput').value;
+  const btn = document.getElementById('uploadBtn');
+  const res = document.getElementById('uploadResult');
+  btn.disabled = true; btn.textContent = check ? 'Checking & importing…' : 'Uploading…';
+  res.textContent = '';
+  const fd = new FormData();
+  for (let f of files) fd.append('files', f);
+  if (check) { fd.append('check','1'); fd.append('proxy',proxy); }
+  try {
+    const data = await (await fetch('/api/admin/bulk', {
+      method: 'POST', headers: {'X-Admin-Pass':adminPass}, body: fd
+    })).json();
+    if (data.ok) {
+      let m = `Added: ${data.added} | Dupes: ${data.dupes} | Invalid: ${data.invalid}`;
+      if (check) m += ` | Dead skipped: ${data.dead}`;
+      res.textContent = m;
       loadAdminData();
     }
+  } finally { btn.disabled = false; btn.textContent = 'Import Cookies'; }
+}
 
-    async function deleteCookie(id) {
-      await fetch('/api/admin/cookies/delete', { method: 'POST', headers: { 'X-Admin-Pass': adminPass, 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) });
-      loadAdminData();
-    }
+async function revokeKey(id) {
+  await fetch('/api/admin/keys/revoke', { method:'POST', headers:{'X-Admin-Pass':adminPass,'Content-Type':'application/json'}, body: JSON.stringify({id}) });
+  loadAdminData();
+}
+async function deleteCookie(id) {
+  await fetch('/api/admin/cookies/delete', { method:'POST', headers:{'X-Admin-Pass':adminPass,'Content-Type':'application/json'}, body: JSON.stringify({id}) });
+  loadAdminData();
+}
+async function deleteAll() {
+  if (!confirm('Delete ALL cookies permanently?')) return;
+  await fetch('/api/admin/delete_all', { method:'POST', headers:{'X-Admin-Pass':adminPass} });
+  loadAdminData();
+}
 
-    async function deleteAll() {
-      if (!confirm('Delete ALL cookies permanently?')) return;
-      await fetch('/api/admin/delete_all', { method: 'POST', headers: { 'X-Admin-Pass': adminPass } });
-      loadAdminData();
-    }
+async function startChecker() {
+  const proxies = document.getElementById('proxyInput').value;
+  const btn = document.getElementById('startCheckBtn');
+  btn.disabled = true; btn.textContent = 'Starting...';
+  await fetch('/api/admin/checker/start', {
+    method:'POST', headers:{'X-Admin-Pass':adminPass,'Content-Type':'application/json'},
+    body: JSON.stringify({proxies})
+  });
+  document.getElementById('checkerStats').style.display = 'block';
+  document.getElementById('checkerLog').style.display = 'block';
+  pollChecker();
+}
 
-    // Checker Logic
-    async function startChecker() {
-      const proxies = document.getElementById('proxyInput').value;
-      const btn = document.getElementById('startCheckBtn');
-      btn.disabled = true; btn.textContent = "Starting...";
-      
-      await fetch('/api/admin/checker/start', {
-        method: 'POST',
-        headers: { 'X-Admin-Pass': adminPass, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ proxies })
-      });
-      
+async function pollChecker() {
+  const s = await (await fetch('/api/admin/checker/status', {headers:{'X-Admin-Pass':adminPass}})).json();
+  document.getElementById('checkerStats').style.display = 'block';
+  document.getElementById('checkerLog').style.display = 'block';
+  document.getElementById('chkProgress').textContent = `${s.checked} / ${s.total}`;
+  document.getElementById('chkKept').textContent = s.kept;
+  document.getElementById('chkDeleted').textContent = s.deleted;
+  const logEl = document.getElementById('checkerLog');
+  logEl.innerHTML = s.logs.map(l => `<div>${l}</div>`).join('');
+  logEl.scrollTop = logEl.scrollHeight;
+  if (s.running) setTimeout(pollChecker, 1500);
+  else {
+    const btn = document.getElementById('startCheckBtn');
+    btn.disabled = false; btn.textContent = 'Start Background Check';
+    loadAdminData();
+  }
+}
+
+async function resumeChecker() {
+  try {
+    const s = await (await fetch('/api/admin/checker/status', {headers:{'X-Admin-Pass':adminPass}})).json();
+    if (s.running) {
+      document.getElementById('startCheckBtn').disabled = true;
+      document.getElementById('startCheckBtn').textContent = 'Running…';
       document.getElementById('checkerStats').style.display = 'block';
       document.getElementById('checkerLog').style.display = 'block';
       pollChecker();
-    }
-
-    async function pollChecker() {
-      const res = await fetch('/api/admin/checker/status', { headers: { 'X-Admin-Pass': adminPass } });
-      const s = await res.json();
-      
+    } else if (s.total > 0) {
+      document.getElementById('checkerStats').style.display = 'block';
+      document.getElementById('checkerLog').style.display = 'block';
       document.getElementById('chkProgress').textContent = `${s.checked} / ${s.total}`;
       document.getElementById('chkKept').textContent = s.kept;
       document.getElementById('chkDeleted').textContent = s.deleted;
-      
-      const logEl = document.getElementById('checkerLog');
-      logEl.innerHTML = s.logs.map(l => `<div>${l}</div>`).join('');
-      logEl.scrollTop = logEl.scrollHeight;
-
-      if (s.running) {
-        setTimeout(pollChecker, 2000);
-      } else {
-        document.getElementById('startCheckBtn').disabled = false;
-        document.getElementById('startCheckBtn').textContent = 'Start Background Check';
-        loadAdminData(); // Refresh cookie table after check
-      }
+      document.getElementById('checkerLog').innerHTML = s.logs.map(l => `<div>${l}</div>`).join('');
     }
+  } catch {}
+}
 
-    // Cube Animations
-    const cubeEl = document.getElementById('cube3d');
-    const cubeStage = document.getElementById('cubeStage');
-    let rotX = -16, rotY = 28, targetRotX = -16, targetRotY = 28;
-    let isDragging = false, startX = 0, startY = 0, scrollSync = true;
-
-    function snapCubeTo(x, y, btnEl) {
-      scrollSync = false;
-      targetRotX = x;
-      targetRotY = y;
-      document.querySelectorAll('.cube-pill-btn').forEach(b => b.classList.remove('active'));
-      if (btnEl) btnEl.classList.add('active');
-    }
-
-    cubeStage.addEventListener('pointerdown', (e) => {
-      isDragging = true; scrollSync = false;
-      startX = e.clientX; startY = e.clientY;
-    });
-
-    window.addEventListener('pointermove', (e) => {
-      if (!isDragging) return;
-      const dx = e.clientX - startX;
-      const dy = e.clientY - startY;
-      targetRotY += dx * 0.65;
-      targetRotX -= dy * 0.65;
-      startX = e.clientX; startY = e.clientY;
-    }, { passive: true });
-
-    window.addEventListener('pointerup', () => { isDragging = false; });
-
-    window.addEventListener('scroll', () => {
-      if (!scrollSync || isDragging) return;
-      const y = window.scrollY;
-      targetRotY = 24 + y * 0.36;
-      targetRotX = -15 + Math.sin(y * 0.0045) * 24;
-    }, { passive: true });
-
-    function animateCube() {
-      rotX += (targetRotX - rotX) * 0.1;
-      rotY += (targetRotY - rotY) * 0.1;
-      cubeEl.style.transform = `translate3d(0, 0, 0) rotateX(${rotX.toFixed(2)}deg) rotateY(${rotY.toFixed(2)}deg)`;
-      requestAnimationFrame(animateCube);
-    }
-    requestAnimationFrame(animateCube);
-
-    document.querySelectorAll('.tilt-3d').forEach(card => {
-      card.addEventListener('pointermove', (e) => {
-        if (e.pointerType === 'touch') return;
-        const rect = card.getBoundingClientRect();
-        const x = (e.clientX - rect.left) / rect.width - 0.5;
-        const y = (e.clientY - rect.top) / rect.height - 0.5;
-        card.style.transform = `perspective(800px) rotateX(${(-y * 6).toFixed(2)}deg) rotateY(${(x * 6).toFixed(2)}deg) translate3d(0, -2px, 0)`;
-      }, { passive: true });
-      card.addEventListener('pointerleave', () => {
-        card.style.transform = 'perspective(800px) rotateX(0deg) rotateY(0deg) translate3d(0, 0, 0)';
-      });
-    });
-
-    const observer = new IntersectionObserver((entries) => {
-      entries.forEach(entry => {
-        if (entry.isIntersecting) {
-          entry.target.classList.add('visible');
-          observer.unobserve(entry.target);
-        }
-      });
-    }, { threshold: 0.08 });
-    document.querySelectorAll('.reveal').forEach(el => observer.observe(el));
-  </script>
+document.querySelectorAll('.tilt-3d').forEach(card => {
+  card.addEventListener('pointermove', e => {
+    if (e.pointerType === 'touch') return;
+    const r = card.getBoundingClientRect();
+    const x = (e.clientX - r.left) / r.width - .5;
+    const y = (e.clientY - r.top) / r.height - .5;
+    card.style.transform = `perspective(800px) rotateX(${-y*6}deg) rotateY(${x*6}deg) translate3d(0,-2px,0)`;
+  });
+  card.addEventListener('pointerleave', () => {
+    card.style.transform = 'perspective(800px) rotateX(0) rotateY(0)';
+  });
+});
+</script>
 </body>
 </html>
