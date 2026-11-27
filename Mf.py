@@ -22,7 +22,6 @@ os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 checker_state = {"running": False, "total": 0, "checked": 0, "kept": 0, "deleted": 0, "logs": []}
 import_state  = {"running": False, "total": 0, "checked": 0, "added": 0, "dead": 0, "dupes": 0, "invalid": 0, "logs": []}
 
-# ---------- Netflix API ----------
 API_URL = "https://ios.prod.ftl.netflix.com/iosui/user/15.48"
 QUERY_PARAMS = {
     "appVersion": "15.48.1",
@@ -129,7 +128,6 @@ def _load_state(name, state):
 def _reset_state(name, state, default):
     state.clear(); state.update(default); _save_state(name, state)
 
-# ---------- helpers ----------
 def _clean(s):
     if not isinstance(s, str): return s
     s = s.replace("\\x40", "@").replace("\x40", "@")
@@ -165,7 +163,6 @@ def list_api_keys():
 def revoke_api_key(kid):
     with _lock, db() as c: c.execute("UPDATE api_keys SET revoked=1 WHERE id=?", (kid,))
 
-# ---------- cookie parsing ----------
 def _split(text):
     text = (text or "").strip()
     if not text: return []
@@ -224,7 +221,6 @@ def extract_cookies(text):
         if nid: out.append((nid, ch, d))
     return out
 
-# ---------- Netflix calls ----------
 def fetch_token(netflix_id, proxy=None):
     h = dict(BASE_HEADERS); h["Cookie"] = f"NetflixId={netflix_id}"
     p = {"http": proxy, "https": proxy} if proxy else None
@@ -329,7 +325,6 @@ def add_cookie(raw_text, meta=None):
                         (raw_text, nid, meta_json, now))
         return cur.lastrowid, nid
 
-# ---------- pool ops ----------
 def pool_stats():
     with db() as c:
         total = c.execute("SELECT COUNT(*) FROM cookies WHERE deleted=0").fetchone()[0]
@@ -344,7 +339,7 @@ def _pick_random(plan=None, country=None):
     q = "SELECT id,netflix_id,meta_json FROM cookies WHERE deleted=0 AND fail_count<?"
     args = [MAX_FAILS]
     if plan:
-        q += " AND json_extract(meta_json, '$.plan') = ?"; args.append(plan.lower())
+        q += " AND json_extract(meta_json, '$.plan') LIKE ?"; args.append(f"%{plan.lower()}%")
     if country:
         q += " AND json_extract(meta_json, '$.country') = ?"; args.append(country.upper())
     q += " ORDER BY RANDOM() LIMIT 1"
@@ -397,7 +392,6 @@ def hard_delete(cid):
 def bulk_delete_all():
     with _lock, db() as c: c.execute("DELETE FROM cookies")
 
-# ---------- proxy parsing ----------
 def parse_proxy_line(line):
     line = line.strip()
     if not line or line.startswith("#"): return None
@@ -434,7 +428,6 @@ def _parse_proxies(proxies_input):
         if p: out.append(p)
     return raw, out
 
-# ---------- background checker ----------
 def run_checker(proxies_input):
     raw, proxies = _parse_proxies(proxies_input)
     _reset_state("checker", checker_state,
@@ -504,14 +497,8 @@ def run_checker(proxies_input):
     checker_state["logs"].append("[DONE]")
     _save_state("checker", checker_state)
 
-# ---------- background importer ----------
 def run_importer(texts, proxies_input):
     raw, proxies = _parse_proxies(proxies_input)
-    all_chunks = []
-    for t in texts:
-        all_chunks.extend([c for c, _, _ in extract_cookies(t)] and [(nid, ch) for nid, ch, _ in extract_cookies(t)])
-
-    # flatten to (netflix_id, raw_chunk)
     flat = []
     for t in texts:
         for nid, ch, _ in extract_cookies(t):
@@ -581,7 +568,6 @@ def run_importer(texts, proxies_input):
     import_state["logs"].append(f"[DONE] added={import_state['added']} dead={import_state['dead']} dupes={import_state['dupes']} invalid={import_state['invalid']}")
     _save_state("importer", import_state)
 
-# ---------- Flask app ----------
 app = Flask(__name__)
 CORS(app, origins="*", allow_headers=["Content-Type", "X-API-Key", "X-Admin-Pass"])
 app.secret_key = PANEL_SECRET
@@ -597,13 +583,14 @@ def health(): return jsonify({"ok": True, "service": "nftoken-api", "db": DB_PAT
 def console(): return send_from_directory(".", "index.html")
 
 def cleanup_nonces():
-    with _lock, db() as c: c.execute("DELETE FROM nonces WHERE created_at < ?", (time.time() - 60,))
+    with _lock, db() as c:
+        c.execute("DELETE FROM nonces WHERE created_at < ?", (time.time() - 120,))
 
 @app.route("/api/public-challenge", methods=["GET"])
 def public_challenge():
     cleanup_nonces()
     nonce = secrets.token_urlsafe(16)
-    ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+    ip = (request.remote_addr or "").split(",")[0].strip()
     with _lock, db() as c:
         c.execute("INSERT INTO nonces(nonce,ip,created_at) VALUES(?,?,?)", (nonce, ip, time.time()))
     return jsonify({"ok": True, "nonce": nonce})
@@ -611,15 +598,25 @@ def public_challenge():
 @app.route("/api/public-generate", methods=["POST"])
 def public_generate():
     data = request.get_json(silent=True) or {}
-    nonce = data.get("nonce"); plan = (data.get("plan") or "").strip().lower()
+    nonce = data.get("nonce")
+    plan = (data.get("plan") or "").strip().lower()
     country = (data.get("country") or "").strip().upper()
-    ip = request.headers.get("X-Forwarded-For", request.remote_addr)
-    if not nonce: return jsonify({"ok": False, "error": "Missing challenge"}), 403
-    cleanup_nonces()
+
+    if not nonce:
+        return jsonify({"ok": False, "error": "Missing challenge"}), 403
+
     with _lock, db() as c:
-        row = c.execute("SELECT nonce FROM nonces WHERE nonce=? AND ip=?", (nonce, ip)).fetchone()
-        if not row: return jsonify({"ok": False, "error": "Invalid/expired challenge"}), 403
+        row = c.execute("SELECT nonce, created_at FROM nonces WHERE nonce=?", (nonce,)).fetchone()
+        if not row:
+            log.warning(f"CHALLENGE FAIL: nonce={nonce[:8]} not found")
+            return jsonify({"ok": False, "error": "Invalid challenge"}), 403
+        age = time.time() - (row["created_at"] or 0)
+        if age > 120:
+            c.execute("DELETE FROM nonces WHERE nonce=?", (nonce,))
+            log.warning(f"CHALLENGE FAIL: nonce={nonce[:8]} age={age:.1f}s")
+            return jsonify({"ok": False, "error": "Challenge expired"}), 403
         c.execute("DELETE FROM nonces WHERE nonce=?", (nonce,))
+
     try:
         r = generate_link(plan=plan, country=country)
         r["meta"]["credit"] = "STYFAIR dev styfair (@styfair)"
